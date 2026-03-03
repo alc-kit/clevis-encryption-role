@@ -31,7 +31,8 @@
   # We attempt to open WITHOUT the key-file.
   # This forces the system to use the Clevis token in the LUKS header.
   ansible.builtin.shell: |
-    cryptsetup luksOpen "/dev/{{ disk_device }}" "crypt-{{ disk_device }}"
+    #cryptsetup luksOpen --batch-mode "/dev/{{ disk_device }}" "crypt-{{ disk_device }}"
+    clevis luks unlock -d "/dev/{{ disk_device }}" -n "crypt-{{ disk_device }}"
   register: tang_verify
   until: tang_verify.rc == 0
   retries: 3
@@ -44,7 +45,8 @@
   ansible.builtin.stat:
     path: "/dev/mapper/crypt-{{ disk_device }}"
   register: crypt_status
-  failed_when: not crypt_status.stat.exists
+  failed_when: not crypt_status.stat.exists and not ansible_check_mode
+
 
 - name: "Get UUID of {{ disk_device }}"
   ansible.builtin.command: blkid -s UUID -o value "/dev/{{ disk_device }}"
@@ -54,7 +56,7 @@
 - name: "Add {{ disk_device }} to /etc/crypttab"
   ansible.builtin.lineinfile:
     path: /etc/crypttab
-    line: "crypt-{{ disk_device }} UUID={{ disk_uuid.stdout }} none luks,nofail,_netdev"
+    line: "crypt-{{ disk_device }} UUID={{ disk_uuid.stdout }} none luks,nofail,noauto,_netdev"
     create: true
     mode: '0600'
     owner: root
