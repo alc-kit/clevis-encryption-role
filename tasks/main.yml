@@ -1,0 +1,246 @@
+---
+# Entry point for the clevis-encryption role.
+#
+# Orchestrates the full lifecycle in two blocks:
+#
+#   BLOCK: provisioning  (when: recovery key does not yet exist on controller)
+#     Generates a DR passphrase, fetches Tang advertisements, formats and
+#     binds all data disks with LUKS2/Clevis, then creates the ZFS pool and
+#     registers it with Proxmox.  The temporary key is always removed from
+#     the remote host via the block's always: handler, even on failure.
+#
+#   BLOCK: boot ordering  (always runs, idempotent)
+#     Writes /etc/crypttab entries and systemd drop-ins that ensure the
+#     correct unlock → pool-import sequence on every boot.  Safe to run
+#     against already-encrypted nodes.  Tag: systemd
+#
+# Key variables (all have defaults in defaults/main.yml except tang_servers):
+#   clevis_encryption_enabled  — set false to skip the entire role
+#   clevis_pool_name           — ZFS pool name
+#   tang_servers               — must be set in group_vars / host_vars
+#   clevis_vault_password_file — vault password file on the controller
+#   clevis_keep_temp_key       — retain /tmp/ansible_luks_key (debug only)
+#   clevis_destroy_existing    — destroy existing pool before provisioning
+
+- name: "Skip: clevis_encryption_enabled is false"
+  ansible.builtin.debug:
+    msg: "clevis-encryption role skipped on {{ inventory_hostname }}"
+  when: not (clevis_encryption_enabled | default(true) | bool)
+
+- name: "Run clevis-encryption role"
+  when: clevis_encryption_enabled | default(true) | bool
+  block:
+
+    # ── PRE-FLIGHT ──────────────────────────────────────────────────────────
+    # These tasks always run.  They establish the facts and installed state
+    # needed by both the provisioning and boot-ordering blocks.
+
+    - name: "Install required encryption packages"
+      ansible.builtin.apt:
+        name:
+          - clevis
+          - clevis-luks
+          - clevis-systemd
+          - cryptsetup
+          - systemd-cryptsetup
+          - util-linux
+          - clevis-initramfs
+          - zfsutils-linux
+          - zfs-initramfs
+        state: present
+        update_cache: true
+
+    - name: "Check whether recovery key already exists on controller"
+      ansible.builtin.stat:
+        path: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt"
+      register: clevis_recovery_key_stat
+      delegate_to: localhost
+      become: false
+      check_mode: false
+
+    - name: "Discover raw physical data disks (largest size group)"
+      # Filters out removable, virtual, and already-mapped devices, then groups
+      # by size and selects the largest group — the data disks.
+      ansible.builtin.set_fact:
+        clevis_raw_disks: "{{ (query_logic | from_json | last).disks }}"
+      vars:
+        query_logic: >-
+          {% set results = [] %}
+          {% set filtered = ansible_devices | dict2items
+             | selectattr('value.removable', 'equalto', '0')
+             | rejectattr('key', 'match', '^(loop|sr|dm-|nbd|md|luks-|crypt)') | list %}
+          {% for size, items in filtered | groupby('value.size') | sort(attribute='1.0.value.sectors') %}
+            {% set total = (items[0].value.sectors | int) * (items[0].value.host_sectorsize | default(512) | int) %}
+            {% set _ = results.append({
+                'size': size, 'size_bytes': total | int,
+                'disks': items | map(attribute='key') | list | sort
+            }) %}
+          {% endfor %}
+          {{ results | to_json }}
+      check_mode: false
+
+    # ── BLOCK: PROVISIONING ─────────────────────────────────────────────────
+    # Skipped entirely when the recovery key vault file already exists on the
+    # controller — that file is created at the end of a successful first run,
+    # so its presence means the node was already provisioned.
+    #
+    # The always: section guarantees the temporary key is removed from the
+    # remote host even if any provisioning task fails midway.
+
+    - name: "Provision disk encryption"
+      when: not clevis_recovery_key_stat.stat.exists
+      tags: [provision]
+      block:
+
+        # --- Recovery key -------------------------------------------------------
+        - name: "Ensure host secrets directory exists on controller"
+          ansible.builtin.file:
+            path: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets"
+            state: directory
+            mode: '0700'
+          delegate_to: localhost
+          become: false
+
+        - name: "Generate 8-word DR passphrase (TitleCase, 4-10 chars per word)"
+          ansible.builtin.shell: |
+            grep -E '^[a-z]{4,10}$' /usr/share/dict/words | shuf -n 8 \
+              | awk '{print toupper(substr($0,1,1)) substr($0,2)}' | paste -sd '-'
+          register: clevis_passphrase_raw
+          delegate_to: localhost
+          become: false
+          check_mode: false
+          no_log: true
+
+        - name: "Store passphrase as play-scoped fact"
+          ansible.builtin.set_fact:
+            clevis_passphrase: "{{ clevis_passphrase_raw.stdout }}"
+          no_log: true
+
+        - name: "Write clear-text recovery key to controller (pre-vault)"
+          ansible.builtin.copy:
+            content: "{{ clevis_passphrase }}"
+            dest: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt"
+            mode: '0600'
+          delegate_to: localhost
+          become: false
+          no_log: true
+
+        - name: "Vault-encrypt recovery key on controller"
+          ansible.builtin.command: >
+            ansible-vault encrypt
+            {{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt
+            --vault-password-file {{ clevis_vault_password_file }}
+          delegate_to: localhost
+          become: false
+
+        # --- Network prerequisites for Tang ------------------------------------
+        - name: "Disable IPv6 (required for stable Tang connectivity)"
+          ansible.posix.sysctl:
+            name: "{{ item }}"
+            value: '1'
+            sysctl_set: true
+            sysctl_file: /etc/sysctl.d/99-ipv6_disable.conf
+            state: present
+            reload: true
+          loop:
+            - "net.ipv6.conf.default.disable_ipv6"
+            - "net.ipv6.conf.all.disable_ipv6"
+
+        - name: "Ensure load-balanced nameservers are present"
+          ansible.builtin.lineinfile:
+            path: /etc/resolv.conf
+            line: "nameserver {{ item }}"
+            insertbefore: '^nameserver'
+            firstmatch: true
+            state: present
+          loop: "{{ dnshosts | shuffle(seed=inventory_hostname) }}"
+          when: dnshosts is defined
+
+        # --- Tang advertisement fetch and SSS assembly ------------------------
+        - name: "Fetch advertisement keys from Tang servers"
+          ansible.builtin.uri:
+            url: "{{ item }}/adv"
+            return_content: true
+            status_code: 200
+            body_format: json
+          loop: "{{ tang_servers | map(attribute='url') }}"
+          register: clevis_tang_adv
+          until: clevis_tang_adv is not failed
+          retries: 3
+          delay: 5
+          check_mode: false
+
+        - name: "Assemble Clevis SSS configuration (t=1 of N)"
+          ansible.builtin.set_fact:
+            tang_sss_cfg: >-
+              {%- set tang_list = [] -%}
+              {%- for resp in clevis_tang_adv.results -%}
+                {%- set _ = tang_list.append({'url': resp.item, 'adv': (resp.content | from_json)}) -%}
+              {%- endfor -%}
+              {{ {'t': 1, 'pins': {'tang': tang_list}} | to_json }}
+
+        - name: "Show assembled SSS config"
+          ansible.builtin.debug:
+            var: tang_sss_cfg
+
+        # --- Optional pool destruction ----------------------------------------
+        - name: "Destroy existing pool (clevis_destroy_existing=true)"
+          ansible.builtin.include_tasks: destroy-pool.yml
+          when: clevis_destroy_existing | default(false) | bool
+          vars:
+            target_pool: "{{ clevis_pool_name }}"
+
+        # --- Disk provisioning ------------------------------------------------
+        - name: "Write temporary key file to remote host"
+          ansible.builtin.copy:
+            dest: /tmp/ansible_luks_key
+            content: "{{ clevis_passphrase }}"
+            owner: root
+            group: root
+            mode: '0600'
+
+        - name: "Provision encryption on {{ item }}"
+          ansible.builtin.include_tasks: provision-disk.yml
+          loop: "{{ clevis_raw_disks }}"
+          loop_control:
+            loop_var: disk_device
+
+        # --- ZFS pool and Proxmox registration --------------------------------
+        - name: "Create ZFS pool and register with Proxmox"
+          ansible.builtin.include_tasks: setup-pool.yml
+
+      always:
+        - name: "Remove temporary key from remote host"
+          ansible.builtin.file:
+            path: /tmp/ansible_luks_key
+            state: absent
+          when: not (clevis_keep_temp_key | default(false) | bool)
+
+    # ── BLOCK: BOOT ORDERING ────────────────────────────────────────────────
+    # Always runs — idempotent and safe on already-encrypted live systems.
+    #
+    # Applies the crypttab entries and systemd drop-ins that ensure disks are
+    # unlocked before ZFS import on every boot.
+    #
+    # Can be run in isolation against an already-encrypted node:
+    #   ansible-playbook ... --tags systemd
+
+    - name: "Apply boot ordering configuration"
+      tags: [systemd]
+      block:
+
+        - name: "Configure crypttab and systemd drop-ins for {{ item }}"
+          ansible.builtin.include_tasks: configure-disk.yml
+          loop: "{{ clevis_raw_disks }}"
+          loop_control:
+            loop_var: disk_device
+
+        - name: "Enable clevis-luks-askpass.path for late-boot unlock"
+          ansible.builtin.systemd:
+            name: clevis-luks-askpass.path
+            enabled: true
+            state: started
+          ignore_errors: "{{ ansible_check_mode }}"
+
+        - name: "Flush handlers (daemon_reload) before continuing"
+          ansible.builtin.meta: flush_handlers
