@@ -293,6 +293,36 @@
               After=remote-cryptsetup.target
           notify: "Reload systemd daemon"
 
+        # ── Proxmox per-pool import unit ───────────────────────────────────
+        # Proxmox creates zfs-import@<pool>.service (e.g. zfs-import@data.service)
+        # as a template unit that imports a specific pool by name.  Without
+        # ordering it will race against LUKS unlock and fail at boot, leaving a
+        # failed unit in systemctl status even though zfs-import-cache.service
+        # recovers later.  Apply the same After=remote-cryptsetup.target ordering
+        # to all zfs-import@ instances via the template drop-in directory.
+
+        - name: "Create systemd drop-in directory for zfs-import@"
+          ansible.builtin.file:
+            path: /etc/systemd/system/zfs-import@.service.d
+            state: directory
+            mode: '0755'
+            owner: root
+            group: root
+
+        - name: "zfs-import@: run after all LUKS devices unlock or time out"
+          ansible.builtin.copy:
+            dest: /etc/systemd/system/zfs-import@.service.d/after-luks-unlock.conf
+            owner: root
+            group: root
+            mode: '0644'
+            content: |
+              [Unit]
+              # Applied to all zfs-import@<pool>.service instances (e.g. zfs-import@data).
+              # Mirrors the zfs-import-cache.service ordering so that Proxmox per-pool
+              # imports also wait for LUKS unlock rather than failing at boot.
+              After=remote-cryptsetup.target
+          notify: "Reload systemd daemon"
+
         - name: "Enable clevis-luks-askpass.path for late-boot unlock"
           ansible.builtin.systemd:
             name: clevis-luks-askpass.path
