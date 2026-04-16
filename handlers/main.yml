@@ -6,3 +6,15 @@
 - name: "Reload systemd daemon"
   ansible.builtin.systemd:
     daemon_reload: true
+
+# Notified by the crypttab task in configure-disk.yml when the entry changes.
+# clevis-initramfs bakes a copy of /etc/crypttab into the initrd; keeping the
+# initrd consistent with the real crypttab prevents confusion during incident
+# response.  For _netdev data disks the initramfs phase skips these entries
+# regardless, so this is a consistency measure rather than a functional one.
+# Runs once even when multiple disks each notify (Ansible handler deduplication).
+# A reboot is still required for the new crypttab flags to take effect at
+# next-boot unlock time.
+- name: "Rebuild initramfs"
+  ansible.builtin.command: update-initramfs -u -k all
+  changed_when: true

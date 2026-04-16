@@ -1,27 +1,44 @@
 ---
 # Configures boot-time integration for a single encrypted data disk:
 #   - /etc/crypttab entry with correct network-ordering flags
+#   - Live discard passthrough applied to running mapper (no reboot needed)
 #   - systemd drop-in: clevis-luks-askpass waits for network-online.target
 #   - systemd drop-in: zfs-import-cache runs after remote-cryptsetup.target
 #
 # Called from tasks/main.yml inside the boot-ordering block, once per disk via
 # include_tasks loop.  The loop variable is disk_device (bare name, e.g. nvme0n1).
 #
-# Idempotent: lineinfile and copy are safe to re-run on live systems.
-# The raw device (/dev/nvmeXn1) does not need to be open; only blkid is run
-# against it to obtain the UUID.
+# Idempotent: lineinfile (with regexp) replaces any existing crypttab entry for
+# this device regardless of its current flags; copy tasks are no-ops when the
+# destination already matches; cryptsetup refresh is only called when the mapper
+# is open and discard is not already active.  The raw device does not need to be
+# open — only blkid is called against it to read the UUID.
 #
-# Tasks that write systemd files notify the "Reload systemd daemon" handler
-# (handlers/main.yml) rather than calling daemon_reload inline.
+# Tasks that write systemd files notify the "Reload systemd daemon" handler.
+# The crypttab task notifies "Rebuild initramfs" so the initrd stays consistent
+# with /etc/crypttab (clevis-initramfs bakes a copy of crypttab into the initrd).
+# For _netdev data disks the initramfs phase skips these entries anyway, so a
+# stale initrd causes no functional breakage — but consistency is worth keeping.
+#
+# Reboot note:
+#   Discard is applied to the running mapper immediately (cryptsetup refresh).
+#   New crypttab flags and systemd ordering take effect at next boot.
+#   dm-crypt workqueue and CPU-pinning tuning belong in proxmox-storage-tuning
+#   and may require a scheduled maintenance reboot.
 
 - name: "{{ disk_device }}: read UUID from device"
   ansible.builtin.command: blkid -s UUID -o value "/dev/{{ disk_device }}"
   register: disk_uuid
   changed_when: false
 
-- name: "{{ disk_device }}: add entry to /etc/crypttab"
+- name: "{{ disk_device }}: write /etc/crypttab entry"
   ansible.builtin.lineinfile:
     path: /etc/crypttab
+    # regexp matches the mapper name at the start of the line so any existing
+    # entry for this device is replaced rather than duplicated.  Without this,
+    # re-running on a node with an older entry (different flags, old noauto style)
+    # would append a second line for the same device.
+    regexp: "^crypt-{{ disk_device }}\\s"
     # Flags explained:
     #   _netdev       — tells systemd this unit needs network; places the unit in
     #                   remote-cryptsetup.target and adds After=network.target.
@@ -39,6 +56,48 @@
     mode: '0600'
     owner: root
     group: root
+  notify: "Rebuild initramfs"
+
+# ── Live discard passthrough ──────────────────────────────────────────────────
+# The crypttab entry above ensures discard is enabled at next boot.
+# This block applies it immediately to the running mapper so the effect is
+# not deferred until the next maintenance reboot.
+#
+# cryptsetup refresh re-applies flags to an open dm-crypt device without
+# interrupting I/O or closing the mapper.  It is safe to call on a live
+# production system with active ZFS workloads.
+
+- name: "{{ disk_device }}: check if LUKS mapper is currently open"
+  ansible.builtin.stat:
+    path: "/dev/mapper/crypt-{{ disk_device }}"
+  register: _mapper_stat
+
+- name: "{{ disk_device }}: read active flags from running mapper"
+  # 'cryptsetup status' reports the live dm-crypt device flags (e.g. 'discards')
+  # for the currently open mapper.  This is distinct from 'luksDump', which reads
+  # the LUKS header on the underlying block device and does not reflect what
+  # flags are active on the running mapping.
+  ansible.builtin.command: cryptsetup status "crypt-{{ disk_device }}"
+  register: _mapper_status
+  changed_when: false
+  failed_when: false
+  when: _mapper_stat.stat.exists
+
+- name: "{{ disk_device }}: apply discard passthrough to running mapper"
+  # --token-only: re-authorizes using the existing LUKS2 Clevis/Tang token.
+  #   Without this flag cryptsetup would prompt for a passphrase, which is
+  #   not available in automated operation.  The token contacts the Tang
+  #   server and unlocks the key slot to authorize the refresh.
+  # --allow-discards: enables TRIM passthrough on the live dm-crypt device.
+  #   Takes effect immediately without interrupting I/O or closing the mapper.
+  # Idempotent: skipped if 'discards' is already listed in the active flags.
+  ansible.builtin.command: >
+    cryptsetup refresh --token-only --allow-discards crypt-{{ disk_device }}
+  when:
+    - _mapper_stat.stat.exists
+    - _mapper_status.stdout is defined
+    - "'discards' not in _mapper_status.stdout"
+  changed_when: true
 
 # ── clevis-luks-askpass network gate ─────────────────────────────────────────
 # Belt-and-suspenders: the clevis service will not attempt tang until the
