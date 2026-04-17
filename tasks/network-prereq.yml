@@ -1,25 +1,30 @@
 ---
-# Deploys (or removes) the clevis-network-ready.service gate.
+# Deploys (or removes) the IPv4-only preference for Clevis Tang connections.
 #
 # PURPOSE
 # -------
 # On dual-stack hosts (e.g. Hetzner), getaddrinfo() returns AAAA records
-# before A records.  If net.ipv6.conf.all.disable_ipv6=1 is set in
-# /etc/sysctl.d/ but systemd-sysctl.service hasn't completed yet when
-# clevis-luks-askpass.service starts, clevis may attempt Tang requests over
-# IPv6 — which fails if the Tang server's whitelist is IPv4-only.
+# before A records by default.  Even with net.ipv6.conf.all.disable_ipv6=1
+# in /etc/sysctl.d/, the sysctl only prevents new IPv6 addresses being
+# assigned — it does NOT remove addresses that were already configured before
+# systemd-sysctl.service ran.  On Hetzner nodes the public IPv6 address is
+# assigned by ifupdown before any sysctl is applied, so IPv6 remains fully
+# functional and getaddrinfo() still resolves AAAA records first.
 #
-# This unit acts as an explicit gate: it runs After=systemd-sysctl.service
-# and Before=clevis-luks-askpass.service, then verifies the sysctl setting is
-# actually in effect.  If the check fails, clevis is blocked — forcing the
-# operator to fix the sysctl configuration rather than silently failing at
-# unlock time.
+# The correct fix is /etc/gai.conf: setting a higher precedence for
+# IPv4-mapped addresses (::ffff:0:0/96) makes getaddrinfo() return A records
+# before AAAA records for every application on the host — clevis, curl, and
+# anything else — without requiring IPv6 to be disabled at the kernel level.
 #
 # DESIGN
 # ------
 # Controlled by clevis_ipv4_only (defaults to false).  When false, any
-# previously deployed gate is removed so the role stays idempotent and the
-# host reverts to standard network ordering.
+# previously deployed configuration is removed so the role stays idempotent.
+#
+# The clevis-network-ready.service gate is retained for boot ordering
+# (After=network-online.target, Before=clevis-luks-askpass.service) but its
+# ExecStart now verifies the gai.conf preference is in place rather than
+# checking the disable_ipv6 sysctl value, which proved insufficient.
 #
 # A separate drop-in file (ipv4-only.conf) is written to the
 # clevis-luks-askpass.service.d directory rather than modifying the existing
@@ -29,9 +34,26 @@
 # Called from the boot-ordering block in tasks/main.yml, after the per-disk
 # configure-disk.yml loop (which creates the drop-in directory).
 
-- name: "Deploy IPv4-only network gate for Clevis"
+- name: "Deploy IPv4-only preference for Clevis"
   when: clevis_ipv4_only | default(false) | bool
   block:
+
+    - name: "Prefer IPv4 over IPv6 in getaddrinfo (gai.conf)"
+      # Setting precedence 100 for IPv4-mapped addresses (::ffff:0:0/96) makes
+      # getaddrinfo() return A records before AAAA records on dual-stack hosts.
+      # The default Debian gai.conf gives native IPv6 higher precedence (50)
+      # than IPv4-mapped (10); raising IPv4-mapped to 100 reverses this.
+      # This is the standard, application-agnostic mechanism — no sysctl
+      # timing issues, no address flushing needed.
+      ansible.builtin.lineinfile:
+        path: /etc/gai.conf
+        regexp: '^precedence\s+::ffff:0:0/96\s+'
+        line: 'precedence ::ffff:0:0/96  100'
+        state: present
+        create: true
+        owner: root
+        group: root
+        mode: '0644'
 
     - name: "Install clevis-network-ready.service"
       ansible.builtin.copy:
@@ -41,14 +63,11 @@
         mode: '0644'
         content: |
           [Unit]
-          Description=Verify IPv6 is disabled before Clevis Tang unlock requests
-          Documentation=man:sysctl(8) man:clevis-luks-askpass(8)
-          # Run after the sysctl service has applied /etc/sysctl.d/ settings,
-          # and after the network stack is fully online.  Both are needed:
-          # systemd-sysctl.service ensures the kernel flag is set, and
-          # network-online.target ensures any pending interface configuration
-          # (which can re-enable IPv6 on new interfaces) has settled.
-          After=systemd-sysctl.service network-online.target
+          Description=Verify IPv4-is-preferred before Clevis Tang unlock requests
+          Documentation=man:gai.conf(5) man:clevis-luks-askpass(8)
+          # Run after the network stack is fully online so that any late
+          # interface configuration has settled before clevis starts.
+          After=network-online.target
           Wants=network-online.target
           # Ordering: this unit must complete before clevis-luks-askpass starts.
           Before=clevis-luks-askpass.service
@@ -56,9 +75,22 @@
           [Service]
           Type=oneshot
           RemainAfterExit=yes
-          # Read the live kernel value rather than parsing a config file — this
-          # confirms the setting is in effect, not merely written to disk.
+          # Two independent checks — both must pass before clevis is allowed
+          # to start making Tang requests.  With Type=oneshot, multiple
+          # ExecStart lines run in order and the service fails on the first
+          # non-zero exit, so each check is expressed separately for clarity.
+          #
+          # Check 1: disable_ipv6 sysctl confirms the kernel will not assign
+          # new IPv6 addresses to interfaces going forward.
           ExecStart=/bin/sh -c 'sysctl -n net.ipv6.conf.all.disable_ipv6 | grep -qx 1'
+          # Check 2: gai.conf IPv4 precedence confirms that getaddrinfo()
+          # returns A records before AAAA records.  This is the effective
+          # guard on dual-stack Hetzner hosts where the IPv6 address is
+          # assigned before systemd-sysctl.service runs and therefore remains
+          # active regardless of the sysctl value — without this preference
+          # clevis resolves Tang hostnames to IPv6 first and connects to Tang
+          # servers that may only accept IPv4 clients.
+          ExecStart=grep -q "^precedence[[:space:]]*::ffff:0:0/96[[:space:]]*100" /etc/gai.conf
 
           [Install]
           # Pulled in automatically when clevis-luks-askpass.service is enabled.
@@ -86,15 +118,20 @@
         content: |
           [Unit]
           # Block unlock attempts until clevis-network-ready has confirmed that
-          # IPv6 is disabled.  This prevents getaddrinfo() from selecting an
-          # IPv6 address for Tang servers that are IPv4-whitelisted only.
+          # the IPv4 preference is in place.
           After=clevis-network-ready.service
           Wants=clevis-network-ready.service
       notify: "Reload systemd daemon"
 
-- name: "Remove IPv4-only network gate (clevis_ipv4_only is false)"
+- name: "Remove IPv4-only preference (clevis_ipv4_only is false)"
   when: not (clevis_ipv4_only | default(false) | bool)
   block:
+
+    - name: "Remove IPv4 precedence from gai.conf if present"
+      ansible.builtin.lineinfile:
+        path: /etc/gai.conf
+        regexp: '^precedence\s+::ffff:0:0/96\s+'
+        state: absent
 
     - name: "Remove clevis-network-ready.service if present"
       ansible.builtin.file:

@@ -58,15 +58,22 @@ clevis_register_proxmox_storage: false
 #     - "10.20.20.2"
 clevis_dns_servers: []
 
-# Set to true to deploy a clevis-network-ready.service gate that verifies
-# IPv6 is disabled (sysctl net.ipv6.conf.all.disable_ipv6=1) before
-# clevis-luks-askpass.service is allowed to make Tang unlock requests.
+# Set to true to prefer IPv4 over IPv6 for all getaddrinfo() calls on the
+# host and to gate clevis-luks-askpass.service on that preference being
+# confirmed at boot.
+#
+# Specifically, this:
+#   1. Writes 'precedence ::ffff:0:0/96  100' to /etc/gai.conf so that
+#      getaddrinfo() returns A records before AAAA records for every
+#      application (clevis, curl, etc.) — the standard fix for dual-stack
+#      hosts where the IPv6 address is assigned before sysctl is applied.
+#   2. Deploys clevis-network-ready.service, which verifies both the sysctl
+#      flag and the gai.conf entry before clevis-luks-askpass.service starts.
 #
 # Use this when:
 #   - The host has dual-stack connectivity (Hetzner, etc.)
-#   - Your Tang servers are whitelisted by IPv4 only
-#   - You have net.ipv6.conf.all.disable_ipv6=1 in /etc/sysctl.d/
+#   - Your Tang servers accept IPv4 connections only
 #
 # Leave false (the default) for environments where Tang is reachable over IPv6
-# or where the network stack is purely IPv4 without sysctl gating.
+# or where the network stack is purely IPv4.
 clevis_ipv4_only: false
