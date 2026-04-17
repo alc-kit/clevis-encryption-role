@@ -267,60 +267,68 @@
           notify: "Reload systemd daemon"
 
         # ── ZFS import ordering ────────────────────────────────────────────
-        # remote-cryptsetup.target is reached after every crypt unit either
-        # unlocks or times out (nofail).  Ordering zfs-import-cache after it
-        # ensures ZFS always sees the mapper devices before pool import.
+        # Problem: remote-cryptsetup.target with nofail is satisfied as soon
+        # as crypt units START, not when they COMPLETE.  Using it as an After=
+        # anchor lets ZFS import race ahead of still-unlocking disks.
+        #
+        # Fix: anchor each ZFS import unit on the individual per-disk
+        # systemd-cryptsetup@ service units.  Those units complete only when
+        # the device is either open or has timed out — the mapper device
+        # exists before the service transitions to 'active' or 'failed'.
+        #
+        # ConditionPathExists= guards: if any mapper is still absent after
+        # all crypt units have run (genuine hardware failure or Tang timeout
+        # with no persistent key), the ZFS import unit is SKIPPED rather than
+        # importing a degraded pool.  The node boots to multi-user.target
+        # without ZFS, keeping it accessible for operator intervention.
+        #
+        # Three units are covered:
+        #   zfs-import-cache   — when /etc/zfs/zpool.cache is populated
+        #   zfs-import-scan    — fallback full-device scan (cache absent/empty)
+        #   zfs-import@        — Proxmox per-pool template unit
+        #
+        # All three receive identical drop-ins so the correct unit runs
+        # regardless of which import path systemd picks.
 
-        - name: "Create systemd drop-in directory for zfs-import-cache"
+        - name: "Create systemd drop-in directories for ZFS import units"
           ansible.builtin.file:
-            path: /etc/systemd/system/zfs-import-cache.service.d
+            path: "/etc/systemd/system/{{ item }}.d"
             state: directory
             mode: '0755'
             owner: root
             group: root
+          loop:
+            - zfs-import-cache.service
+            - zfs-import-scan.service
+            - zfs-import@.service
 
-        - name: "zfs-import-cache: run after all LUKS devices unlock or time out"
+        - name: "ZFS import units: wait for individual LUKS mappers, skip if any absent"
           ansible.builtin.copy:
-            dest: /etc/systemd/system/zfs-import-cache.service.d/after-luks-unlock.conf
+            dest: "/etc/systemd/system/{{ item }}.d/after-luks-unlock.conf"
             owner: root
             group: root
             mode: '0644'
             content: |
               [Unit]
-              # Wait for all remote-encrypted volumes to either unlock or time out
-              # (nofail) before attempting pool import.  Without this, zfs-import-cache
-              # runs while the mapper devices are still absent and the import fails.
-              After=remote-cryptsetup.target
-          notify: "Reload systemd daemon"
-
-        # ── Proxmox per-pool import unit ───────────────────────────────────
-        # Proxmox creates zfs-import@<pool>.service (e.g. zfs-import@data.service)
-        # as a template unit that imports a specific pool by name.  Without
-        # ordering it will race against LUKS unlock and fail at boot, leaving a
-        # failed unit in systemctl status even though zfs-import-cache.service
-        # recovers later.  Apply the same After=remote-cryptsetup.target ordering
-        # to all zfs-import@ instances via the template drop-in directory.
-
-        - name: "Create systemd drop-in directory for zfs-import@"
-          ansible.builtin.file:
-            path: /etc/systemd/system/zfs-import@.service.d
-            state: directory
-            mode: '0755'
-            owner: root
-            group: root
-
-        - name: "zfs-import@: run after all LUKS devices unlock or time out"
-          ansible.builtin.copy:
-            dest: /etc/systemd/system/zfs-import@.service.d/after-luks-unlock.conf
-            owner: root
-            group: root
-            mode: '0644'
-            content: |
-              [Unit]
-              # Applied to all zfs-import@<pool>.service instances (e.g. zfs-import@data).
-              # Mirrors the zfs-import-cache.service ordering so that Proxmox per-pool
-              # imports also wait for LUKS unlock rather than failing at boot.
-              After=remote-cryptsetup.target
+              # Wait for every individual LUKS device service to complete (open or
+              # timed out) before attempting pool import.  remote-cryptsetup.target
+              # with nofail is satisfied when units START, not complete — it cannot
+              # reliably gate ZFS import.
+              #
+              # ConditionPathExists= lines: if any mapper device is absent after all
+              # crypt units have run, this unit is skipped rather than importing the
+              # pool with missing members.  The node remains accessible but ZFS is not
+              # mounted — no silent degraded imports.
+              {% for disk in clevis_raw_disks %}
+              After=systemd-cryptsetup@crypt-{{ disk }}.service
+              {% endfor %}
+              {% for disk in clevis_raw_disks %}
+              ConditionPathExists=/dev/mapper/crypt-{{ disk }}
+              {% endfor %}
+          loop:
+            - zfs-import-cache.service
+            - zfs-import-scan.service
+            - zfs-import@.service
           notify: "Reload systemd daemon"
 
         - name: "Enable clevis-luks-askpass.path for late-boot unlock"
