@@ -238,6 +238,16 @@
       tags: [systemd]
       block:
 
+        # ── IPv4-only gate (must run before per-disk discard refresh) ──────
+        # network-prereq.yml writes the gai.conf precedence fix that makes
+        # getaddrinfo() prefer IPv4 over IPv6.  It must run before the
+        # configure-disk.yml loop because the live 'cryptsetup refresh
+        # --token-only' in that loop contacts Tang via Clevis — if gai.conf
+        # is not yet in place, getaddrinfo() still resolves Tang hostnames
+        # to IPv6 and the token-only auth fails silently.
+        - name: "Deploy or remove IPv4-only network gate (clevis_ipv4_only)"
+          ansible.builtin.include_tasks: network-prereq.yml
+
         - name: "Configure crypttab and live discard for {{ item }}"
           ansible.builtin.include_tasks: configure-disk.yml
           loop: "{{ clevis_raw_disks }}"
@@ -340,9 +350,6 @@
             enabled: true
             state: started
           ignore_errors: "{{ ansible_check_mode }}"
-
-        - name: "Deploy or remove IPv4-only network gate (clevis_ipv4_only)"
-          ansible.builtin.include_tasks: network-prereq.yml
 
         - name: "Flush handlers (daemon_reload) before continuing"
           ansible.builtin.meta: flush_handlers
