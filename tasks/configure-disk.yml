@@ -84,23 +84,28 @@
   check_mode: false
 
 - name: "{{ disk_device }}: apply discard passthrough to running mapper"
-  # --token-only: re-authorizes using the existing LUKS2 Clevis/Tang token.
-  #   Without this flag cryptsetup would prompt for a passphrase, which is
-  #   not available in automated operation.  The token contacts the Tang
-  #   server and unlocks the key slot to authorize the refresh.
-  # --allow-discards: enables TRIM passthrough on the live dm-crypt device.
-  #   Takes effect immediately without interrupting I/O or closing the mapper.
-  # --persistent: writes allow-discards into the LUKS2 header persistent flags
-  #   so the setting is applied on every future activation regardless of
-  #   crypttab.  Defense in depth alongside the crypttab discard option.
-  #   LUKS2 only — all disks provisioned by this role use LUKS2.
-  # Idempotent: skipped if 'discards' is already listed in the active flags.
-  # ansible.builtin.shell rather than command: the Clevis token handler is a
-  # shell script that calls jose/curl; the stripped PATH in ansible.builtin.command
-  # causes silent rc=1 failures even though the same command works as root in an
-  # interactive session.  shell runs via /bin/sh -c and inherits a complete PATH.
-  ansible.builtin.shell: >
-    cryptsetup refresh --token-only --allow-discards --persistent crypt-{{ disk_device }}
+  # Reloads the live dm-crypt device table to add allow_discards using dmsetup
+  # rather than 'cryptsetup refresh --token-only'.  The device is already open
+  # and the volume key is already in the kernel keyring; dmsetup reload reuses
+  # the existing keyring reference without any Tang/Clevis authentication round-
+  # trip.  This avoids the Tang dependency that causes 'cryptsetup refresh
+  # --token-only' to fail silently when Tang is temporarily unreachable.
+  #
+  # Steps: read current table (key shown as ":N:logon:cryptsetup:UUID" keyring
+  # ref), increment the optional-param count, append allow_discards, then
+  # suspend → reload → resume (same sequence cryptsetup refresh uses internally;
+  # the suspend is sub-millisecond and safe on live ZFS workloads).
+  #
+  # Persistence is handled by the crypttab 'discard' flag written above.
+  # Idempotent: skipped when 'discards' is already in the active mapper flags.
+  ansible.builtin.shell: |
+    TABLE=$(dmsetup table --showkeys "crypt-{{ disk_device }}")
+    FIXED=$(echo "$TABLE" | awk '{print $1,$2,$3,$4,$5,$6,$7,$8}')
+    OPTCNT=$(echo "$TABLE" | awk '{print (NF>8) ? $9+1 : 1}')
+    OPTS=$(echo "$TABLE" | awk '{if(NF>9){for(i=10;i<=NF;i++) printf "%s ",$i}}')
+    dmsetup suspend "crypt-{{ disk_device }}"
+    dmsetup reload  "crypt-{{ disk_device }}" --table "$FIXED $OPTCNT ${OPTS}allow_discards"
+    dmsetup resume  "crypt-{{ disk_device }}"
   when:
     - _mapper_status.rc == 0
     - "'discards' not in _mapper_status.stdout"
