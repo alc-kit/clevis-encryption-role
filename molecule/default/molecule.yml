@@ -6,8 +6,8 @@ driver:
   name: docker
 
 platforms:
-  - name: clevis-encryption-debian12
-    image: geerlingguy/docker-debian12-ansible:latest
+  - name: clevis-encryption-debian13
+    image: geerlingguy/docker-debian13-ansible:latest
     pre_build_image: true
     privileged: true
     cgroupns_mode: host
@@ -34,7 +34,7 @@ provisioner:
       interpreter_python: auto_silent
   inventory:
     host_vars:
-      clevis-encryption-debian12:
+      clevis-encryption-debian13:
         # Pre-set the disk list so the discovery task is skipped.
         # The prepare playbook creates /dev/loop0 as a LUKS2 device.
         clevis_raw_disks:

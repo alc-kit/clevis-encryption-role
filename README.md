@@ -272,7 +272,7 @@ recoverable state.
 
 The role ships with a [Molecule](https://ansible.readthedocs.io/projects/molecule/)
 test suite under `molecule/default/`.  It uses the Docker driver with a
-privileged Debian 12 container that has `systemd` as PID 1.
+privileged Debian 13 (Trixie) container that has `systemd` as PID 1.
 
 ### Prerequisites
 
