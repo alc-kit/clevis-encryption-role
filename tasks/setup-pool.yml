@@ -73,15 +73,19 @@
   ansible.builtin.command: "zpool set cachefile=/etc/zfs/zpool.cache {{ clevis_pool_name }}"
   when: clevis_pool_exists.rc != 0
 
-- name: "Register '{{ clevis_pool_name }}' with Proxmox storage"
-  ansible.builtin.command: >
-    pvesm add zfspool {{ clevis_pool_name }}
-    -pool {{ clevis_pool_name }}
-    -content images,rootdir
-    -sparse 1
-  register: pvesm_add
-  failed_when:
-    - pvesm_add.rc != 0
-    - "'already exists' not in pvesm_add.stderr"
-  changed_when: pvesm_add.rc == 0
+- name: "Register Proxmox zfspool storage for {{ clevis_pool_name }}"
+  community.proxmox.proxmox_storage:
+    api_host: "{{ ansible_host | default(inventory_hostname) }}"
+    api_user: "{{ proxmox_user }}"
+    api_password: "{{ proxmox_password }}"
+    validate_certs: "{{ proxmox_validate_certs | default(false) }}"
+    name: "{{ clevis_pool_name }}"
+    type: zfspool
+    content: [images, rootdir]
+    zfspool_options:
+      pool: "{{ clevis_pool_name }}"
+      sparse: true
+    state: present
+  delegate_to: localhost
+  become: false
   when: clevis_register_proxmox_storage | default(false) | bool

@@ -2,16 +2,17 @@
 # roles/pve_destroy_zpool/tasks/main.yml
 
 # --- PHASE 1: Remove from Proxmox Configuration ---
-- name: Check if Proxmox storage pool '{{ target_pool }}' exists
-  ansible.builtin.command: "pvesm status -storage {{ target_pool }}"
-  register: pvesm_check
-  failed_when: false
-  changed_when: false
-  check_mode: false
-
-- name: Remove storage '{{ target_pool }}' from Proxmox configuration
-  ansible.builtin.command: "pvesm remove {{ target_pool }}"
-  when: pvesm_check.rc == 0
+- name: "Remove Proxmox storage definition for {{ target_pool }}"
+  community.proxmox.proxmox_storage:
+    api_host: "{{ ansible_host | default(inventory_hostname) }}"
+    api_user: "{{ proxmox_user }}"
+    api_password: "{{ proxmox_password }}"
+    validate_certs: "{{ proxmox_validate_certs | default(false) }}"
+    name: "{{ target_pool }}"
+    state: absent
+  delegate_to: localhost
+  become: false
+  failed_when: false   # storage may already be gone — destroy is idempotent at this layer
 
 # --- PHASE 2: Gather pool and disk information ---
 - name: Check if ZFS pool '{{ target_pool }}' exists on the OS
