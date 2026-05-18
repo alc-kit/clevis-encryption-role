@@ -41,10 +41,10 @@ clevis_destroy_existing: false
 clevis_zfs_pool_topology: "mirror"
 
 # ── Proxmox storage registration ─────────────────────────────────────────────
-# Set to true to run 'pvesm add zfspool' after pool creation, registering the
-# pool as a Proxmox VE storage backend.  Set false when using this role on
-# non-Proxmox Debian hosts.
-clevis_register_proxmox_storage: false
+# This role intentionally does NOT register the pool with Proxmox.  The role's
+# job ends at "imported ZFS pool".  Proxmox-specific concerns live in
+# proxmox-install (tasks/register-zfs-storage.yml) so this role stays reusable
+# for any LUKS+ZFS deployment, not just Proxmox.
 
 # ── DNS servers for provisioning ─────────────────────────────────────────────
 # Optional list of nameservers to prepend to /etc/resolv.conf during the
