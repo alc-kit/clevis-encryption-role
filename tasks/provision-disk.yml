@@ -14,14 +14,18 @@
 # Idempotency: the cryptsetup isLuks guard skips all destructive steps when the
 # device is already a LUKS volume, so re-running is safe.
 
-- name: "{{ disk_device }}: check if already LUKS-formatted"
+- name: "Check whether already LUKS-formatted: {{ disk_device }}"
   ansible.builtin.command: cryptsetup isLuks "/dev/{{ disk_device }}"
   register: disk_is_luks
   changed_when: false
   failed_when: false
 
-- name: "{{ disk_device }}: check if already has a Clevis binding"
-  ansible.builtin.shell: clevis luks list -d "/dev/{{ disk_device }}" 2>/dev/null | grep -qE 'sss|tang'
+- name: "Check whether already bound to Clevis/Tang: {{ disk_device }}"
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      clevis luks list -d "/dev/{{ disk_device }}" 2>/dev/null | grep -qE 'sss|tang'
+    executable: /bin/bash
   register: disk_has_clevis
   changed_when: false
   failed_when: false
@@ -29,53 +33,58 @@
 
 # ── Destructive steps — only run on unencrypted devices ──────────────────────
 
-- name: "{{ disk_device }}: wipe existing filesystem signatures"
+- name: "Wipe existing filesystem signatures: {{ disk_device }}"
   ansible.builtin.command: wipefs -a "/dev/{{ disk_device }}"
   changed_when: true
   when: disk_is_luks.rc != 0
 
-- name: "{{ disk_device }}: format with LUKS2"
+- name: "Format with LUKS2: {{ disk_device }}"
   ansible.builtin.command: >
     cryptsetup luksFormat --batch-mode
     --key-file /tmp/ansible_luks_key
     "/dev/{{ disk_device }}"
+  changed_when: true
   when: disk_is_luks.rc != 0
 
-- name: "{{ disk_device }}: bind to Tang servers via SSS"
-  ansible.builtin.shell: |
-    clevis luks bind -d "/dev/{{ disk_device }}" -k /tmp/ansible_luks_key sss \
-    '{{ tang_sss_cfg }}'
-  args:
+- name: "Bind to Tang servers via SSS: {{ disk_device }}"
+  ansible.builtin.shell:
+    cmd: |
+      clevis luks bind -d "/dev/{{ disk_device }}" -k /tmp/ansible_luks_key sss \
+      '{{ tang_sss_cfg }}'
     executable: /bin/bash
+  changed_when: true
   # Also re-bind if the device is LUKS but has no clevis token (e.g. partial
   # previous run that formatted but did not bind).
   when: disk_is_luks.rc != 0 or (disk_has_clevis is defined and disk_has_clevis.rc != 0)
 
 # ── Open, test Tang unlock, close ─────────────────────────────────────────────
 
-- name: "{{ disk_device }}: open with key file"
+- name: "Open LUKS mapper with key file: {{ disk_device }}"
   ansible.builtin.command: >
     cryptsetup luksOpen --key-file /tmp/ansible_luks_key
     "/dev/{{ disk_device }}" "crypt-{{ disk_device }}"
   args:
     creates: "/dev/mapper/crypt-{{ disk_device }}"
 
-- name: "{{ disk_device }}: close to test Tang network unlock"
-  ansible.builtin.shell: |
-    if [ -b "/dev/mapper/crypt-{{ disk_device }}" ]; then
-      cryptsetup luksClose "crypt-{{ disk_device }}"
-    fi
+- name: "Close LUKS mapper to test Tang network unlock: {{ disk_device }}"
+  ansible.builtin.shell:
+    cmd: |
+      if [ -b "/dev/mapper/crypt-{{ disk_device }}" ]; then
+        cryptsetup luksClose "crypt-{{ disk_device }}"
+      fi
+    executable: /bin/bash
   changed_when: false
   when: disk_is_luks.rc != 0
 
-- name: "{{ disk_device }}: verify Tang decryption succeeds (1-of-N SSS)"
+- name: "Verify Tang decryption succeeds (1-of-N SSS): {{ disk_device }}"
   # Deliberately omits --key-file to force the system to use the Clevis token.
-  ansible.builtin.shell: >
+  ansible.builtin.command: >
     clevis luks unlock -d "/dev/{{ disk_device }}" -n "crypt-{{ disk_device }}"
   register: tang_verify
   until: tang_verify.rc == 0
   retries: 3
   delay: 5
+  changed_when: tang_verify.rc == 0
   environment:
     PATH: "{{ ansible_env.PATH }}:/usr/bin:/usr/local/bin"
   when: disk_is_luks.rc != 0

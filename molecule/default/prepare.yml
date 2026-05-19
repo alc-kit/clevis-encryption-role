@@ -41,15 +41,21 @@
         creates: /dev/loop0
 
     - name: "Format /dev/loop0 as LUKS2 (passphrase: molecule-test)"
-      ansible.builtin.shell: |
-        echo -n "molecule-test" | cryptsetup luksFormat --type luks2 \
-          --batch-mode /dev/loop0 -
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          echo -n "molecule-test" | cryptsetup luksFormat --type luks2 \
+            --batch-mode /dev/loop0 -
+        executable: /bin/bash
       args:
         creates: /dev/mapper/crypt-loop0
 
     - name: "Open LUKS device as crypt-loop0"
-      ansible.builtin.shell: |
-        echo -n "molecule-test" | cryptsetup luksOpen /dev/loop0 crypt-loop0 -
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          echo -n "molecule-test" | cryptsetup luksOpen /dev/loop0 crypt-loop0 -
+        executable: /bin/bash
       args:
         creates: /dev/mapper/crypt-loop0
 

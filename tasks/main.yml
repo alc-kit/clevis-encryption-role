@@ -128,10 +128,14 @@
           become: false
 
         - name: "Generate 8-word DR passphrase (TitleCase, 4-10 chars per word)"
-          ansible.builtin.shell: |
-            grep -E '^[a-z]{4,10}$' /usr/share/dict/words | shuf -n 8 \
-              | awk '{print toupper(substr($0,1,1)) substr($0,2)}' | paste -sd '-'
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              grep -E '^[a-z]{4,10}$' /usr/share/dict/words | shuf -n 8 \
+                | awk '{print toupper(substr($0,1,1)) substr($0,2)}' | paste -sd '-'
+            executable: /bin/bash
           register: clevis_passphrase_raw
+          changed_when: false   # generates the secret but writes nothing on its own
           delegate_to: localhost
           become: false
           check_mode: false
@@ -156,6 +160,7 @@
             ansible-vault encrypt
             {{ clevis_recovery_key_path }}
             --vault-password-file {{ clevis_vault_password_file }}
+          changed_when: true   # always rewrites the file when invoked (gated by parent block)
           delegate_to: localhost
           become: false
 
@@ -262,7 +267,7 @@
             owner: root
             group: root
 
-        - name: "clevis-luks-askpass: wait for network-online before attempting Tang"
+        - name: "Wait for network-online before clevis-luks-askpass attempts Tang"
           ansible.builtin.copy:
             dest: /etc/systemd/system/clevis-luks-askpass.service.d/network-online.conf
             owner: root
