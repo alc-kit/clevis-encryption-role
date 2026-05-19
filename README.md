@@ -5,8 +5,14 @@ binds the unlock key to one or more Tang servers using Clevis Shamir Secret
 Sharing, and configures the correct systemd boot ordering so encrypted devices
 are unlocked before any dependent service (ZFS, NFS, databases) starts.
 
-Optionally creates a ZFS pool on top of the encrypted devices and registers it
-with Proxmox VE.
+Optionally creates a ZFS pool on top of the encrypted devices.
+
+The role is **storage-vendor-agnostic** — it ends at "imported ZFS pool".
+If you want the pool registered as a Proxmox VE storage backend, do that on
+the consuming side (e.g., `community.proxmox.proxmox_storage` with
+`state: present`).  Earlier versions of this role embedded that call;
+it was removed in 2026-05 so the role stays reusable for any LUKS+ZFS
+deployment, not just Proxmox.
 
 ## Why this role exists
 
@@ -56,7 +62,6 @@ automation:
 | `clevis_encryption_enabled` | `true` | Set `false` to skip the entire role. Useful when the role is included unconditionally in a playbook but encryption is not needed on every host. |
 | `clevis_pool_name` | `"data"` | Name of the ZFS pool created on top of the encrypted devices. |
 | `clevis_zfs_pool_topology` | `"mirror"` | Vdev layout. See [ZFS pool topology](#zfs-pool-topology). |
-| `clevis_register_proxmox_storage` | `false` | Run `pvesm add zfspool` after pool creation to register the pool as a Proxmox VE storage backend. |
 | `clevis_vault_password_file` | `"~/.ansible_vault_pass"` | Path to the Ansible Vault password file on the controller, used to encrypt the per-host recovery key. |
 | `clevis_keep_temp_key` | `false` | Retain `/tmp/ansible_luks_key` on the remote host after provisioning. Leave `false` in production. |
 | `clevis_destroy_existing` | `false` | Destroy an existing ZFS pool before (re-)provisioning. **Destructive.** |
@@ -200,10 +205,10 @@ cryptsetup luksOpen /dev/<device> crypt-<device>
           - "192.168.1.1"
 ```
 
-### With ZFS pool and Proxmox registration
+### With ZFS pool, register storage on the caller side
 
 ```yaml
-- name: "Encrypt data disks and register with Proxmox"
+- name: "Encrypt data disks; register pool with Proxmox afterwards"
   hosts: new_proxmox_hosts
   become: true
   gather_facts: true
@@ -216,7 +221,23 @@ cryptsetup luksOpen /dev/<device> crypt-<device>
         clevis_encryption_enabled: "{{ encrypt_data_disks | default(false) }}"
         clevis_pool_name: "data"
         clevis_zfs_pool_topology: "mirror"
-        clevis_register_proxmox_storage: true
+
+    - name: "Register the ZFS pool as Proxmox storage"
+      community.proxmox.proxmox_storage:
+        api_host: "{{ ansible_host | default(inventory_hostname) }}"
+        api_user: "{{ proxmox_user }}"
+        api_password: "{{ proxmox_password }}"
+        validate_certs: false
+        name: "{{ clevis_pool_name }}"
+        type: zfspool
+        content: [images, rootdir]
+        zfspool_options:
+          pool: "{{ clevis_pool_name }}"
+          sparse: true
+        state: present
+      delegate_to: localhost
+      become: false
+      when: encrypt_data_disks | default(false) | bool
 ```
 
 With the following in `group_vars`:

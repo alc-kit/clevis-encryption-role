@@ -1,0 +1,11 @@
+---
+# Role-level collection dependencies for clevis-encryption.
+#
+# Installed by the consuming project with:
+#   ansible-galaxy collection install -r requirements.yml
+#
+# The role itself uses only ansible.builtin and one ansible.posix module
+# (sysctl) — minimal external surface so the role is easy to consume.
+collections:
+  - name: ansible.posix
+    version: ">=1.5.0"
