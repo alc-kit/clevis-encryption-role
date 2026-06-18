@@ -40,6 +40,16 @@ clevis_destroy_existing: false
 #   stripe  — no redundancy; all disks striped (data loss on any single disk).
 clevis_zfs_pool_topology: "mirror"
 
+# ── Pool management ───────────────────────────────────────────────────────────
+# ensure-pool.yml opens the LUKS mappers and creates/imports the ZFS pool when
+# missing.  It runs on every full invocation (outside the recovery-key-gated
+# provisioning block) so the pool is created even on a re-run that skipped
+# provisioning — the fix for "pool never created because an earlier run failed
+# after writing the recovery key".  Set false to skip pool management entirely
+# (used by the Molecule test, which runs in a container with no usable ZFS
+# kernel module).
+clevis_ensure_pool: true
+
 # ── Proxmox storage registration ─────────────────────────────────────────────
 # This role intentionally does NOT register the pool with Proxmox.  The role's
 # job ends at "imported ZFS pool".  Proxmox-specific concerns live in

@@ -1,0 +1,96 @@
+---
+# Disk-set systemd drop-ins that gate ZFS pool import on every individual LUKS
+# mapper being unlocked first, plus the clevis-luks-askpass network gate.
+#
+# These are disk-SET (not per-disk) units keyed off clevis_raw_disks, so they
+# live here — written once after the per-disk configure-disk.yml loop.  Factored
+# out of main.yml so replace-disk.yml can refresh them after the pool's disk set
+# changes.
+#
+# Idempotent and safe on already-encrypted live systems.
+
+# ── clevis-luks-askpass network gate ───────────────────────────────────────
+# Belt-and-suspenders: clevis will not attempt Tang until the network is fully
+# online, regardless of crypttab ordering.
+
+- name: "Create systemd drop-in directory for clevis-luks-askpass"
+  ansible.builtin.file:
+    path: /etc/systemd/system/clevis-luks-askpass.service.d
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: "Wait for network-online before clevis-luks-askpass attempts Tang"
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/clevis-luks-askpass.service.d/network-online.conf
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      After=network-online.target
+      Wants=network-online.target
+  notify: "Reload systemd daemon"
+
+# ── ZFS import ordering ─────────────────────────────────────────────────────
+# remote-cryptsetup.target with nofail is satisfied as soon as crypt units
+# START, not when they COMPLETE, so it cannot reliably gate ZFS import.  Anchor
+# each ZFS import unit on the individual per-disk systemd-cryptsetup@ units and
+# guard with ConditionPathExists on every mapper — if any mapper is absent after
+# all crypt units have run, the import unit is SKIPPED rather than importing a
+# degraded pool, keeping the node accessible for operator intervention.
+#
+# Three units are covered (zfs-import-cache, zfs-import-scan, zfs-import@) so the
+# correct unit runs regardless of which import path systemd picks.
+
+- name: "Create systemd drop-in directories for ZFS import units"
+  ansible.builtin.file:
+    path: "/etc/systemd/system/{{ item }}.d"
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+  loop:
+    - zfs-import-cache.service
+    - zfs-import-scan.service
+    - zfs-import@.service
+
+- name: "ZFS import units: wait for individual LUKS mappers, skip if any absent"
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item }}.d/after-luks-unlock.conf"
+    owner: root
+    group: root
+    mode: '0644'
+    content: |
+      [Unit]
+      # Wait for every individual LUKS device service to complete (open or
+      # timed out) before attempting pool import.  remote-cryptsetup.target
+      # with nofail is satisfied when units START, not complete — it cannot
+      # reliably gate ZFS import.
+      #
+      # ConditionPathExists= lines: if any mapper device is absent after all
+      # crypt units have run, this unit is skipped rather than importing the
+      # pool with missing members.  The node remains accessible but ZFS is not
+      # mounted — no silent degraded imports.
+      {% for disk in clevis_raw_disks %}
+      After=systemd-cryptsetup@crypt-{{ disk }}.service
+      {% endfor %}
+      {% for disk in clevis_raw_disks %}
+      ConditionPathExists=/dev/mapper/crypt-{{ disk }}
+      {% endfor %}
+  loop:
+    - zfs-import-cache.service
+    - zfs-import-scan.service
+    - zfs-import@.service
+  notify: "Reload systemd daemon"
+
+- name: "Enable clevis-luks-askpass.path for late-boot unlock"
+  ansible.builtin.systemd:
+    name: clevis-luks-askpass.path
+    enabled: true
+    state: started
+  ignore_errors: "{{ ansible_check_mode }}"
+
+- name: "Flush handlers (daemon_reload) before continuing"
+  ansible.builtin.meta: flush_handlers
