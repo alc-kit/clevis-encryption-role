@@ -102,6 +102,8 @@
       changed_when: true
       environment:
         PATH: "{{ ansible_env.PATH }}:/usr/bin:/usr/local/bin"
+        # regen re-fetches the Tang adv via curl; pin the IP family as elsewhere.
+        CURL_HOME: "{{ clevis_curl_home }}"
 
     # ── Verify gate: the new key MUST open every disk before removing old ─
     - name: "Rotate | VERIFY the new key opens every disk (gate before removal)"

@@ -15,6 +15,12 @@
 set -uo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
+# clevis luks unlock -> clevis-decrypt-tang -> `curl` (no -q, so curl reads a
+# config file).  Point curl at the role-managed curlrc so the Tang recovery
+# request uses the IP family selected at provision time (see network-prereq.yml).
+# A missing dir/file is harmless: curl finds no config and behaves as dual-stack.
+export CURL_HOME={{ clevis_curl_home }}
+
 RETRIES={{ clevis_unlock_retries | default(6) | int }}
 DELAY={{ clevis_unlock_retry_delay | default(10) | int }}
 ATTEMPT_TIMEOUT={{ clevis_unlock_attempt_timeout | default(30) | int }}

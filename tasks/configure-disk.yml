@@ -112,7 +112,6 @@
   ansible.builtin.shell:
     cmd: |
       set -uo pipefail
-      export PATH=/usr/sbin:/usr/bin:/sbin:/bin
       NAME="crypt-{{ disk_device }}"
       DEV="/dev/{{ disk_device }}"
       applied=""
@@ -145,6 +144,10 @@
       echo "could not enable live discard on $NAME (Clevis recovery failed); it activates on next boot via clevis-unlock-data" >&2
       exit 1
     executable: /bin/bash
+  environment:
+    PATH: "/usr/sbin:/usr/bin:/sbin:/bin"
+    # clevis-decrypt-tang curls the recovery endpoint; pin the IP family.
+    CURL_HOME: "{{ clevis_curl_home }}"
   when:
     - _mapper_status.rc == 0
     - "'discards' not in _mapper_status.stdout"

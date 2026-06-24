@@ -46,7 +46,10 @@ provisioner:
         # recovery key file is pre-created by the prepare playbook.
         tang_servers:
           - url: "http://127.0.0.1:7500"
-        clevis_ipv4_only: true
+        # auto-probe: prepare.yml runs a real Tang on 127.0.0.1:7500 bound to IPv4
+        # only, so the probe sees v4 OK / v6 FAIL and deterministically pins ipv4
+        # — exercising the real detection path, not just the curlrc write.
+        clevis_curl_ip_version: auto
         clevis_register_proxmox_storage: false
         clevis_vault_password_file: "/dev/null"
         # Skip ensure-pool: the container has no usable ZFS kernel module, and

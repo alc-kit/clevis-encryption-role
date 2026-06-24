@@ -31,8 +31,9 @@ automation:
   things
 - Ordering `zfs-import-cache.service` after `remote-cryptsetup.target` so ZFS
   never races the unlock
-- A network-ready gate for dual-stack hosts where Tang servers are
-  IPv4-whitelisted only (`clevis_ipv4_only`)
+- A clevis-scoped IP-family pin (via a `curlrc`) for dual-stack hosts where
+  Tang servers are reachable over only one of IPv4 / IPv6
+  (`clevis_curl_ip_version`)
 - Shamir Secret Sharing (SSS) across multiple Tang servers for HA unlock
   without requiring all servers to be available simultaneously
 
@@ -67,7 +68,11 @@ automation:
 | `clevis_destroy_existing` | `false` | Destroy an existing ZFS pool before (re-)provisioning. **Destructive.** |
 | `clevis_luks_open_options` | `"--allow-discards"` | Options passed to `cryptsetup open` when `clevis-unlock-data` opens each mapper at boot (`clevis luks unlock -o`). The durable place to enable discard, since the `noauto` data disks ignore the crypttab `discard` option. Append `--perf-no_read_workqueue --perf-no_write_workqueue` to make dm-crypt perf flags durable too; set `""` for none. |
 | `clevis_dns_servers` | `[]` | Nameservers to prepend to `/etc/resolv.conf` during provisioning. Useful when Tang is reachable only via an internal DNS zone not in the host's default resolver. Empty = no change. |
-| `clevis_ipv4_only` | `false` | Deploy a systemd gate that verifies IPv6 is disabled before allowing Tang unlock attempts. See [IPv4-only mode](#ipv4-only-mode). |
+| `clevis_curl_ip_version` | `auto` | IP family clevis's curl uses for Tang: `auto` (probe and pin the working family), `ipv4`, `ipv6`, or `dual` (no pin). See [Tang IP family](#tang-ip-family-ipv4--ipv6). |
+| `clevis_curl_home` | `/etc/clevis/curl` | Directory used as `CURL_HOME` for clevis's curl calls; the role writes `<clevis_curl_home>/.curlrc` here. |
+| `clevis_curl_probe_connect_timeout` | `5` | Per-server connect timeout (seconds) for `auto` reachability probing. |
+| `clevis_curl_probe_max_time` | `15` | Per-server total timeout (seconds) for `auto` reachability probing. |
+| `clevis_ipv4_only` | `false` | **Deprecated** — superseded by `clevis_curl_ip_version`. When `true` (and `clevis_curl_ip_version` is left at `auto`) it maps to `clevis_curl_ip_version: ipv4`, with a deprecation warning. |
 | `clevis_recovery_key_path` | `{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt` | Path on the Ansible controller where the vault-encrypted recovery key is stored. Override when using a non-standard inventory layout or a separate secrets directory. |
 
 ### Tang servers
@@ -107,35 +112,48 @@ The role auto-discovers data disks by grouping all non-removable, non-virtual
 block devices by size and selecting the largest size group.  This reliably
 selects data disks over the OS/boot disk on typical server hardware.
 
-### IPv4-only mode
+### Tang IP family (IPv4 / IPv6)
 
-On dual-stack hosts (e.g. Hetzner dedicated servers), `getaddrinfo()` returns
-AAAA records before A records.  If `net.ipv6.conf.all.disable_ipv6=1` is set
-in `/etc/sysctl.d/` but `systemd-sysctl.service` has not completed when
-`clevis-luks-askpass.service` starts, Clevis may attempt Tang connections over
-IPv6 — which fails silently if the Tang server only whitelists IPv4.
+Clevis fetches the Tang advertisement (at bind) and POSTs the recovery request
+(at every unlock) by shelling out to `curl`.  On a dual-stack host where Tang is
+reachable over only one family, that call can pick the wrong one and fail.
 
-Setting `clevis_ipv4_only: true` deploys `clevis-network-ready.service`, a
-oneshot systemd unit that:
+**Why curl's own dual-stack logic isn't enough.** curl's Happy Eyeballs races
+IPv4 and IPv6 at the **TCP layer** and commits to whichever completes the
+handshake first; it never reconsiders based on the HTTP status.  If a Tang load
+balancer answers the IPv6 handshake but returns `403` to a non-whitelisted IPv6
+client, curl "wins" on IPv6 and then fails — even though IPv4 would have returned
+the advertisement.  The family that yields a **valid adv** must be selected
+explicitly.
 
-1. Runs `After=systemd-sysctl.service network-online.target`
-2. Verifies `sysctl net.ipv6.conf.all.disable_ipv6` is `1` (live kernel value,
-   not config file)
-3. Is ordered `Before=clevis-luks-askpass.service`
+**How the role does it.** Because `clevis-encrypt-tang` / `clevis-decrypt-tang`
+call `curl` *without* `-q`, curl reads a config file.  The role writes a
+clevis-scoped `curlrc` to `clevis_curl_home` (`/etc/clevis/curl/.curlrc`) and
+points curl at it with `CURL_HOME` wherever it drives clevis — at bind, at
+rotate/regen, and in the boot-time `clevis-unlock-data` script.  The pin is
+therefore confined to clevis and does **not** touch host-global resolution.
 
-If the check fails at boot, Clevis is blocked and the operator sees a clear
-failure rather than a silent unlock loop.
+`clevis_curl_ip_version` selects the family:
 
-**Prerequisites for `clevis_ipv4_only: true`:**
-- `net.ipv6.conf.all.disable_ipv6=1` must be in `/etc/sysctl.d/` (managed
-  separately, e.g. by your network configuration role)
-- Tang servers must be reachable over IPv4
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | At provision time, probe each Tang `/adv` over IPv4 and IPv6 (`curl -fg --ipvN`, so a `403` counts as a failure) and bake the family that returns a valid adv. Chooses `dual` only when every server answers on **both**. If nothing is reachable it warns and **preserves any existing pin** (falling back to `dual` only when no curlrc exists yet), so a transient Tang outage during a routine re-run can't downgrade a known-good pin; the real failure then surfaces at the actual bind/unlock step. |
+| `ipv4` | Write `--ipv4` to the curlrc. |
+| `ipv6` | Write `--ipv6`. |
+| `dual` | Write no family flag; rely on curl's own dual-stack / Happy-Eyeballs logic. Appropriate only when Tang genuinely returns a valid adv on both families. |
+
+This replaces the previous host-global approach (`/etc/gai.conf` IPv4 precedence
++ `net.ipv6.conf.all.disable_ipv6=1` + a `clevis-network-ready.service` gate),
+which disabled IPv6 for the entire host and was silently ignored when the host
+used `systemd-resolved` (which does its own RFC 6724 sort and never consults
+`gai.conf`).  Those artifacts are removed on every run — see
+[Upgrade notes](#removed-host-global-ipv4-only-gate).
 
 ## Tags
 
 | Tag | What it runs |
 |---|---|
-| `prestage` | Package install + Tang network preconditions (DNS, IPv6 sysctl, gai.conf gate). Idempotent and safe on un-encrypted nodes. Use this to do most of the setup ahead of the destructive LUKS-format step, shortening the actual maintenance window. |
+| `prestage` | Package install + Tang network preconditions (DNS, IP-family probe + curlrc). Idempotent and safe on un-encrypted nodes. Use this to do most of the setup ahead of the destructive LUKS-format step, shortening the actual maintenance window. |
 | `provision` | The provisioning block only (LUKS format, Clevis bind, ZFS pool creation). Skipped automatically if the recovery key already exists on the controller. |
 | `systemd` | The boot ordering block only (crypttab, systemd drop-ins). Safe to run against already-encrypted live nodes. Does NOT re-run prestage — combine with `--tags prestage,systemd` if you also want the network gate re-validated. |
 
@@ -249,8 +267,9 @@ tang_servers:
   - url: "https://tang-backup.example.com"
 
 encrypt_data_disks: true
-clevis_ipv4_only: false   # set true on Hetzner or other dual-stack hosts
-                          # where Tang is IPv4-only
+clevis_curl_ip_version: auto   # auto-probe IPv4/IPv6 and pin the family that
+                               # serves a valid Tang adv. Set ipv4/ipv6 to force
+                               # one, or dual to leave curl to choose.
 ```
 
 ### Re-apply boot ordering to existing nodes
@@ -265,14 +284,12 @@ drop-ins without touching the LUKS key slots.
 ## How boot unlock works
 
 ```
-systemd-sysctl.service ──┐
-network-online.target ───┤
-                         ▼
-             clevis-network-ready.service   ← only when clevis_ipv4_only=true
+network-online.target
                          │
                          ▼
          clevis-luks-askpass.service
-         (fetches Tang adv, unlocks LUKS)
+         (fetches Tang adv, unlocks LUKS; curl reads the role curlrc
+          via CURL_HOME so the pinned IP family is used)
                          │
                          ▼
          remote-cryptsetup.target
@@ -302,43 +319,51 @@ recoverable state.
 
 ## Upgrade notes
 
-### Removed: networking.service early bring-up drop-in
+### Automatic legacy cleanup
 
-An earlier version of this role wrote `/etc/systemd/system/networking.service.d/10-override.conf`
-to start networking before `sysinit` so Clevis could reach Tang. It was validated
-to **break boot** (a systemd ordering cycle) and has been replaced by the late,
-decoupled unlock chain (`clevis-unlock-data` → `encrypted-storage-import` → …).
+The role design has changed several times; older versions deployed artifacts the
+current design no longer uses. `tasks/cleanup-legacy.yml` removes them on **every**
+run (it runs first, under `tags: always`, so it applies under any tag filter and
+on a host last touched by any old version). No manual cleanup is required.
 
-This role **no longer writes** that drop-in. It also deliberately does **not
-delete** it: the role cannot prove it owns a generically-named file in another
-service's drop-in directory, and a reusable role must never clobber a file it
-doesn't own.
+Cleanup never blind-deletes a file it cannot prove it wrote — a reusable role must
+not clobber a generically-named file an operator or another role legitimately
+owns. Removals fall into three safety tiers:
 
-**If you ran a pre-rework version of this role**, that stale drop-in may still be
-on your nodes and will keep breaking boot. Remove it as a deliberate, one-time
-step from your own playbook/runbook — you have the context to know the file is
-yours. A content-guarded example (removes the file only when it matches what this
-role used to write — the distinctive `After=… ifupdown2-pre.service sysinit.target`
-line — so it never touches an unrelated `10-override.conf`):
+1. **Provably ours by name** — units/symlinks whose name is unique to this role.
+   Removed when present.
+   - `clevis-network-ready.service` (the old IPv4-preference boot gate) and its
+     `clevis-luks-askpass.service.wants/` symlink.
+2. **Marker-scoped** — an Ansible block delimited by this role's marker inside a
+   shared file. Only the marked block is removed.
+   - the `ipv4-only` precedence block in `/etc/gai.conf`.
+3. **Content-guarded** — a generic name and/or a foreign service's drop-in
+   directory. Removed **only** when the file's content carries this role's
+   ownership header *or* a distinctive signature it always wrote; a same-named
+   foreign file with neither is preserved (and logged).
+   - `zfs-import-{cache,scan}.service.d/{override,after-luks-unlock}.conf` and
+     `zfs-import@.service.d/after-luks-unlock.conf` (old ZFS-import ordering
+     drop-ins — the source of an early boot ordering cycle).
+   - `networking.service.d/10-override.conf` (an early bring-up drop-in validated
+     to **break boot**; guarded on its distinctive
+     `… ifupdown2-pre.service sysinit.target` line).
+   - `clevis-luks-askpass.service.d/ipv4-only.conf` (gated askpass on the old
+     network-ready unit).
+   - `/etc/sysctl.d/99-ipv6_disable.conf` (host-global IPv6 disable; also resets
+     `disable_ipv6` to `0` on the live kernel — a reboot fully restores IPv6
+     addressing on interfaces that had it stripped).
 
-```yaml
-- name: "Stat the legacy clevis networking.service drop-in"
-  ansible.builtin.stat:
-    path: /etc/systemd/system/networking.service.d/10-override.conf
-  register: _dropin
-- name: "Read it (only when present)"
-  ansible.builtin.slurp:
-    src: /etc/systemd/system/networking.service.d/10-override.conf
-  register: _dropin_raw
-  when: _dropin.stat.exists
-- name: "Remove only the old clevis-written drop-in"
-  ansible.builtin.file:
-    path: /etc/systemd/system/networking.service.d/10-override.conf
-    state: absent
-  when:
-    - _dropin.stat.exists
-    - "'ifupdown2-pre.service sysinit.target' in (_dropin_raw.content | b64decode)"
-```
+The host-global IPv4-only gate (tier 2 + the sysctl + `clevis-network-ready`) is
+superseded by the clevis-scoped `curlrc` — see
+[Tang IP family](#tang-ip-family-ipv4--ipv6). If you previously set
+`clevis_ipv4_only: true` in inventory, the role still honours it (mapped to
+`clevis_curl_ip_version: ipv4` with a deprecation warning) — replace it with
+`clevis_curl_ip_version` at your convenience.
+
+> Earlier releases left the `networking.service` drop-in for the operator to
+> remove manually (a reusable role shouldn't delete files it can't prove it owns).
+> That concern is now resolved *within* the role by the content guard above, so
+> the manual runbook step is no longer needed.
 
 ## Testing
 
@@ -379,11 +404,11 @@ The test suite focuses on the **boot-ordering block** (always runs, idempotent):
   required flags (`_netdev`, `x-systemd.after=network-online.target`, `discard`,
   `nofail`)
 - `/dev/mapper/crypt-loop0` is open and `discards` is active in the dm-crypt table
-- `/etc/gai.conf` contains both IPv4 precedence lines (because `clevis_ipv4_only: true`
+- `/etc/clevis/curl/.curlrc` pins `--ipv4` (because `clevis_curl_ip_version: ipv4`
   is set in the test scenario)
-- `clevis-network-ready.service` is deployed
-- `clevis-luks-askpass.service.d/ipv4-only.conf` and `network-online.conf` drop-ins
-  are deployed
+- the retired `gai.conf` block, `clevis-network-ready.service`, and
+  `clevis-luks-askpass.service.d/ipv4-only.conf` are **absent**
+- `clevis-luks-askpass.service.d/network-online.conf` drop-in is deployed
 
 The provisioning block (LUKS format, Clevis bind, ZFS pool creation) is skipped
 in the test because `prepare.yml` pre-creates the recovery key file — the same
@@ -425,41 +450,41 @@ version with `cryptsetup --version` and check whether
 
 ---
 
-### Tang connections use IPv6 on dual-stack hosts (`clevis_ipv4_only`)
+### Tang unlock fails on a dual-stack host (wrong IP family)
 
-**Symptom:** Clevis fails to unlock at boot on a dual-stack host.  Manually
-running `clevis luks unlock` or `curl <tang-url>/adv` works only when IPv6 is
-explicitly blocked.
+**Symptom:** Clevis fails to fetch the advertisement or unlock at boot on a
+dual-stack host, even though `curl --ipv4 <tang-url>/adv` (or `--ipv6`) succeeds
+by hand.
 
-**Cause:** On dual-stack hosts (e.g. Hetzner dedicated servers), `getaddrinfo()`
-returns AAAA records before A records by default.  Even when
-`net.ipv6.conf.all.disable_ipv6=1` is configured in `/etc/sysctl.d/`, the sysctl
-only prevents *new* IPv6 addresses being assigned — addresses already configured
-before `systemd-sysctl.service` ran remain active.  Clevis then attempts Tang
-connections over IPv6, which fails if the Tang server only accepts IPv4 clients.
+**Cause:** curl's Happy Eyeballs races IPv4 and IPv6 at the **TCP layer** and
+commits to whichever completes the handshake first; it never reconsiders based
+on the HTTP status.  If a Tang load balancer answers the IPv6 handshake but
+returns `403` to a non-whitelisted IPv6 client (or the IPv6 path is a blackhole),
+curl commits to IPv6 and the request fails — even though IPv4 would have served
+the advertisement.
 
-**Fix:** Set `clevis_ipv4_only: true`.  This writes a two-line `/etc/gai.conf`
-block that explicitly raises IPv4-mapped precedence (100) and lowers native IPv6
-precedence (1), making `getaddrinfo()` return A records first for all
-applications.
+**Fix:** Pin the family clevis uses. Leave `clevis_curl_ip_version: auto` to let
+the role probe each Tang `/adv` over both families at provision time and bake the
+one that returns a valid adv, or set it explicitly to `ipv4` / `ipv6`. The role
+writes the choice to `/etc/clevis/curl/.curlrc` and points clevis's curl at it
+via `CURL_HOME` — at bind, at rotate/regen, and in the boot-time
+`clevis-unlock-data` script.
 
+Inspect the resulting pin on the host:
+
+```bash
+cat /etc/clevis/curl/.curlrc
+# verify clevis actually reads it:
+CURL_HOME=/etc/clevis/curl curl -v https://<tang-url>/adv >/dev/null
 ```
-precedence ::ffff:0:0/96  100
-precedence ::/0           1
-```
 
-A single `precedence ::ffff:0:0/96  100` line is not sufficient: glibc may
-fall back to a built-in default of 40 for `::/0`, and RFC 6724 Rule 5
-(prefer matching scope/label) can still favour IPv6 before Rule 6 (precedence)
-is reached.  Both lines are required.
-
-**Caveat — `systemd-resolved`:** If the host uses `systemd-resolved` as its
-stub resolver (`/etc/resolv.conf` → `127.0.0.53`), `gai.conf` changes have
-no effect on DNS resolution order.  `systemd-resolved` performs its own RFC 6724
-address sorting and does not consult `/etc/gai.conf`.  In this case the only
-reliable fix is to ensure IPv6 is fully disabled at the kernel level before
-`clevis-luks-askpass.service` starts, or to restrict the Tang DNS record to
-A records only.
+**Why not `gai.conf` / `disable_ipv6`:** earlier versions raised IPv4 precedence
+in `/etc/gai.conf` and disabled IPv6 host-wide. That disabled IPv6 for everything
+on the box and — crucially — was silently ignored under `systemd-resolved`
+(`/etc/resolv.conf` → `127.0.0.53`), which does its own RFC 6724 sort and never
+consults `gai.conf`. The curlrc pin is scoped to clevis and is immune to both
+problems. See [Upgrade notes](#removed-host-global-ipv4-only-gate)
+for cleanup of the old artifacts (handled automatically on the next run).
 
 ---
 

@@ -5,7 +5,7 @@
 #
 #   PRESTAGE  (tag: prestage; idempotent and safe on un-encrypted nodes)
 #     Installs encryption packages, applies Tang network preconditions
-#     (DNS, IPv6 sysctl when clevis_ipv4_only=true, gai.conf gate).
+#     (DNS, plus the clevis curl IP-family pin written to a curlrc).
 #     Run on its own with --tags prestage to do this work ahead of the
 #     actual encryption window.
 #
@@ -36,6 +36,16 @@
 - name: "Run clevis-encryption role"
   when: clevis_encryption_enabled | default(true) | bool
   block:
+
+    # ── LEGACY CLEANUP ──────────────────────────────────────────────────────
+    # Remove artifacts that previous versions of this role deployed and the
+    # current design no longer uses.  tags: always so it runs under any tag
+    # filter (full run, --tags prestage|provision|systemd) and on hosts last
+    # touched by any old version.  Ordered FIRST so the IPv6 live-reset happens
+    # before the network-prereq IP-family probe (which may need IPv6 up).
+    - name: "Clean up artifacts from previous role versions"
+      ansible.builtin.include_tasks: cleanup-legacy.yml
+      tags: always
 
     # ── PRESTAGE ────────────────────────────────────────────────────────────
     # Pre-stageable tasks: package install + Tang network preconditions.
@@ -124,8 +134,8 @@
         - name: "Generate and vault the DR recovery key"
           ansible.builtin.include_tasks: generate-recovery-key.yml
 
-        # Network preconditions for Tang (DNS, IPv6 sysctl, gai.conf gate) are
-        # handled by tasks/prestage.yml above — runs unconditionally on every
+        # Network preconditions for Tang (DNS + the clevis curl IP-family pin)
+        # are handled by tasks/prestage.yml above — runs unconditionally on every
         # full-role invocation, so by the time we reach this point the host is
         # already configured to talk to the Tang servers correctly.
 
@@ -180,11 +190,11 @@
       tags: [systemd]
       block:
 
-        # The IPv4-only network gate (gai.conf precedence + clevis-network-ready.service)
-        # is handled by tasks/prestage.yml.  It is NOT re-run from this block;
+        # The clevis curl IP-family pin (curlrc under clevis_curl_home) is
+        # handled by tasks/prestage.yml.  It is NOT re-run from this block;
         # operators using --tags systemd to re-apply boot ordering on an already-
         # provisioned node should combine with prestage if they also want the
-        # network gate re-validated:  --tags prestage,systemd
+        # IP-family pin re-evaluated:  --tags prestage,systemd
 
         - name: "Configure crypttab and live discard for each data disk"
           ansible.builtin.include_tasks: configure-disk.yml

@@ -107,22 +107,42 @@ clevis_dns_servers: []
 #   clevis_recovery_key_path: "{{ playbook_dir }}/secrets/{{ inventory_hostname }}/luks_recovery_key.txt"
 clevis_recovery_key_path: "{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt"
 
-# Set to true to prefer IPv4 over IPv6 for all getaddrinfo() calls on the
-# host and to gate clevis-luks-askpass.service on that preference being
-# confirmed at boot.
+# ── Tang connection IP family (IPv4 / IPv6 selection) ─────────────────────────
+# Clevis fetches the Tang advertisement (at bind) and POSTs the recovery request
+# (at every unlock) using `curl`.  Because clevis invokes curl WITHOUT -q, curl
+# reads a config file — so the role pins the IP family for *clevis only* by
+# writing a curlrc and pointing curl at it via CURL_HOME (clevis_curl_home).
+# This replaces the old host-global gai.conf / disable_ipv6 approach, which was
+# silently bypassed by systemd-resolved and disabled IPv6 for the whole host.
 #
-# Specifically, this:
-#   1. Writes 'precedence ::ffff:0:0/96  100' to /etc/gai.conf so that
-#      getaddrinfo() returns A records before AAAA records for every
-#      application (clevis, curl, etc.) — the standard fix for dual-stack
-#      hosts where the IPv6 address is assigned before sysctl is applied.
-#   2. Deploys clevis-network-ready.service, which verifies both the sysctl
-#      flag and the gai.conf entry before clevis-luks-askpass.service starts.
+# Why pin a family at all — curl's Happy Eyeballs races IPv4 and IPv6 at the TCP
+# layer and commits to whichever completes the handshake first; it never
+# reconsiders based on the HTTP status.  So a dual-stack host whose Tang answers
+# the IPv6 TCP handshake (e.g. a load balancer) but returns 403 to non-whitelisted
+# IPv6 clients "wins" on IPv6 and then fails — even though IPv4 would have
+# returned the advertisement.  Pinning the family that actually yields a valid
+# adv is the only reliable fix.
 #
-# Use this when:
-#   - The host has dual-stack connectivity (Hetzner, etc.)
-#   - Your Tang servers accept IPv4 connections only
-#
-# Leave false (the default) for environments where Tang is reachable over IPv6
-# or where the network stack is purely IPv4.
+#   auto  — (default) at provision time, probe each Tang /adv over IPv4 and IPv6
+#           and bake the family that returns a valid advertisement.  Chooses
+#           `dual` (no pin) only when every server answers on BOTH families.
+#   ipv4  — force --ipv4 for every clevis curl call
+#   ipv6  — force --ipv6
+#   dual  — pin nothing; rely on curl's own dual-stack / Happy-Eyeballs logic
+clevis_curl_ip_version: auto
+
+# Directory used as CURL_HOME for clevis's curl calls; the role writes
+# <clevis_curl_home>/.curlrc here and curl reads $CURL_HOME/.curlrc.
+clevis_curl_home: /etc/clevis/curl
+
+# Per-server timeouts (seconds) for `auto` reachability probing.
+clevis_curl_probe_connect_timeout: 5
+clevis_curl_probe_max_time: 15
+
+# DEPRECATED — superseded by clevis_curl_ip_version.  When true (and
+# clevis_curl_ip_version is left at its 'auto' default) it is treated as
+# clevis_curl_ip_version=ipv4 for backward compatibility, with a deprecation
+# warning.  The legacy gai.conf precedence block, the 99-ipv6_disable.conf
+# sysctl, and clevis-network-ready.service are removed on every run regardless
+# of this flag.
 clevis_ipv4_only: false

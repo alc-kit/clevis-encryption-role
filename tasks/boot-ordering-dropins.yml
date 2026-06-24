@@ -25,11 +25,10 @@
 
 # NOTE: an EARLIER version of this role wrote a networking.service early bring-up
 # drop-in (networking.service.d/10-override.conf) that was validated to BREAK boot.
-# This role no longer writes it. It deliberately does NOT delete it either: a
-# reusable role cannot prove it owns a generically-named drop-in in another
-# service's directory, so removing it could clobber a file a different role or the
-# operator legitimately owns. Revoking the stale file is a CONSUMER concern (only
-# the operator knows a node ran the old version) — see "Upgrade notes" in README.md.
+# This role no longer writes it.  It is now removed by tasks/cleanup-legacy.yml —
+# but CONTENT-GUARDED: because '10-override.conf' is a generic name in another
+# service's drop-in directory, cleanup deletes it only when its content carries
+# this role's distinctive ordering line (or ownership header), never blindly.
 
 # ── clevis-luks-askpass network gate (belt-and-suspenders) ──────────────────
 - name: "Create systemd drop-in directory for clevis-luks-askpass"
@@ -172,20 +171,12 @@
       WantedBy=multi-user.target
   notify: "Reload systemd daemon"
 
-# ── Remove obsolete drop-ins from earlier designs ───────────────────────────
-# The zfs-import-scan override (Requires/After clevis-unlock-data) was the source
-# of the ordering cycle; the cache/@ after-luks-unlock.conf were fail-closed.
-- name: "Remove obsolete ZFS-import boot-ordering drop-ins"
-  ansible.builtin.file:
-    path: "{{ item }}"
-    state: absent
-  loop:
-    - /etc/systemd/system/zfs-import-scan.service.d/override.conf
-    - /etc/systemd/system/zfs-import-cache.service.d/after-luks-unlock.conf
-    - /etc/systemd/system/zfs-import-cache.service.d/override.conf
-    - /etc/systemd/system/zfs-import-scan.service.d/after-luks-unlock.conf
-    - /etc/systemd/system/zfs-import@.service.d/after-luks-unlock.conf
-  notify: "Reload systemd daemon"
+# NOTE: the obsolete ZFS-import ordering drop-ins from earlier designs
+# (zfs-import-{cache,scan}.service.d/{override,after-luks-unlock}.conf and
+# zfs-import@.service.d/after-luks-unlock.conf — the source of the boot ordering
+# cycle) are removed by tasks/cleanup-legacy.yml.  They live in foreign service
+# drop-in dirs (and 'override.conf' is a generic name), so cleanup removes them
+# only when their content proves this role wrote them — not by a blind delete.
 
 # ── Leave the stock zfs-import units at the Proxmox default ─────────────────
 # (cache enabled, scan disabled).  With cachefile=none the data pool is not in
