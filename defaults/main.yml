@@ -62,6 +62,21 @@ clevis_unlock_retries: 3
 clevis_unlock_retry_delay: 5
 clevis_unlock_attempt_timeout: 20
 
+# Options passed to the underlying `cryptsetup open` when clevis-unlock-data
+# opens each data mapper at boot (`clevis luks unlock -o`).  This is the DURABLE
+# place to enable discard: the data-disk crypttab entries carry `noauto`, so
+# systemd-cryptsetup never opens them and the crypttab `discard` option is inert
+# — the mapper only gains allow_discards if it is opened with it here.
+#
+# --allow-discards passes TRIM/discard through dm-crypt to the NVMe (required for
+# ZFS autotrim to reach the device).  dm-crypt workqueue/perf flags
+# (--perf-no_read_workqueue etc.) are deliberately NOT included by default: they
+# are a storage-tuning concern owned by the proxmox_storage_tuning role.  To make
+# them durable at open too, append them here, e.g.:
+#   clevis_luks_open_options: "--allow-discards --perf-no_read_workqueue --perf-no_write_workqueue"
+# Set to "" to open with no extra options (mapper comes up without discard).
+clevis_luks_open_options: "--allow-discards"
+
 # ── Proxmox storage registration ─────────────────────────────────────────────
 # This role intentionally does NOT register the pool with Proxmox.  The role's
 # job ends at "imported ZFS pool".  Proxmox-specific concerns live in
