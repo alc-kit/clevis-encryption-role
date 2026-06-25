@@ -394,20 +394,24 @@ superseded by the clevis-scoped `curlrc` — see
 
 ## Testing
 
-The role ships **two** [Molecule](https://ansible.readthedocs.io/projects/molecule/)
-scenarios, one per layer of the stack.  Both use the Docker driver with a
-privileged Debian 13 (Trixie) container running `systemd` as PID 1.
+Testing is layered to match the stack — each tier proves what the cheaper tier
+below it cannot:
 
-| Scenario | Layer under test | Block device? | Runtime |
+| Tier | Where | Layer under test | Needs |
 |---|---|---|---|
-| `molecule/network` | clevis↔Tang **crypto + network** — the IP-family selection this role performs | No | **Rootless** podman/Docker, any CI |
-| `molecule/default` | **LUKS keyslot** — `clevis luks bind`/`unlock -o`, crypttab, durable `allow_discards` | Yes (loopback) | **Rootful** (see below) |
+| 0 | `molecule/network` | clevis↔Tang **crypto + network** — the IP-family selection this role performs | **Rootless** podman/Docker; any CI |
+| 1 | `molecule/default` | **LUKS keyslot** — `clevis luks bind`/`unlock -o`, crypttab, durable `allow_discards` | **Rootful** container (loopback dev) |
+| 2 | `tests/vm/` | **Real boot ordering** — boot-time unlock from an external Tang, the decoupled import chain, reboot-durable discard | QEMU/KVM VM (+ a Tang container) |
 
+Tiers 0–1 are [Molecule](https://ansible.readthedocs.io/projects/molecule/)
+scenarios (Docker driver, privileged Debian 13 container with `systemd` as PID 1).
 The split mirrors how clevis works: `clevis encrypt`/`decrypt` round-trip with
 Tang over `curl` (the network layer — no disk, no privilege), while binding a key
-to a LUKS keyslot needs a real block device.  The `network` scenario runs the
+to a LUKS keyslot needs a real block device. The `network` scenario runs the
 **same role** device-free (`clevis_raw_disks: []`), so the network handling — the
-subject of `clevis_curl_ip_version` — is testable anywhere.
+subject of `clevis_curl_ip_version` — is testable anywhere. Boot ordering can only
+be proven by a real boot + reboot, so it lives in the VM tier — see
+[`tests/vm/README.md`](tests/vm/README.md).
 
 > **Why `default` needs rootful.** Setting up a loopback LUKS device requires
 > creating a `/dev/loop*` node and `CAP_SYS_ADMIN` against the initial namespace.
@@ -466,12 +470,13 @@ idempotence → verify → destroy`).  To iterate, use
 - a vendored harness proves `clevis luks unlock -o "--allow-discards"` and the
   live-refresh path land `allow_discards`
 
-In both scenarios the provisioning block (LUKS format on real disks, Clevis bind,
-ZFS pool creation) is skipped because `prepare.yml` pre-creates the recovery-key
-file — the same mechanism that prevents re-provisioning on live nodes.  ZFS is out
-of scope for the container tier (`clevis_install_zfs_packages: false`,
-`clevis_ensure_pool: false`); it is the higher-level consumer and belongs in a
-future VM-based scenario.
+In both Molecule scenarios the provisioning block (LUKS format on real disks,
+Clevis bind, ZFS pool creation) is skipped because `prepare.yml` pre-creates the
+recovery-key file — the same mechanism that prevents re-provisioning on live
+nodes.  ZFS is out of scope for the container tier (`clevis_install_zfs_packages:
+false`, `clevis_ensure_pool: false`); it is the higher-level consumer and is
+exercised for real in the **Tier-2 VM test** (`tests/vm/`), which provisions ZFS
+on LUKS and verifies the pool imports at boot.
 
 ### How disk mocking works
 
