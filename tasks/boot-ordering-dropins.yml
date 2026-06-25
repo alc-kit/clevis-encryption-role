@@ -181,6 +181,21 @@
 # ── Leave the stock zfs-import units at the Proxmox default ─────────────────
 # (cache enabled, scan disabled).  With cachefile=none the data pool is not in
 # the cache, so the early cache import no-ops; our late chain imports it.
+#
+# Only touch units that actually exist: when ZFS is not installed on this node
+# (clevis_install_zfs_packages=false, or ZFS owned by a separate role that has
+# not run yet) the zfs-import units are absent, and enabling a non-existent unit
+# would hard-fail.  Restoring "Proxmox defaults" is meaningless without them, so
+# skip cleanly in that case.
+- name: "Detect the stock zfs-import units"  # noqa: command-instead-of-module
+  # The systemd module can enable/disable a unit but cannot LIST/detect which
+  # unit files exist, so query systemctl directly (read-only).
+  ansible.builtin.command: systemctl list-unit-files zfs-import-cache.service zfs-import-scan.service
+  register: _zfs_import_units
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
 - name: "Restore Proxmox-default ZFS import units"
   ansible.builtin.systemd:
     name: "{{ item.unit }}"
@@ -188,6 +203,7 @@
   loop:
     - { unit: zfs-import-cache.service, enabled: true }
     - { unit: zfs-import-scan.service, enabled: false }
+  when: item.unit in (_zfs_import_units.stdout | default(''))
   ignore_errors: "{{ ansible_check_mode }}"
 
 - name: "Enable the encrypted-storage barrier + clevis-luks-askpass.path"

@@ -29,12 +29,15 @@
   tasks:
 
     - name: "Install test dependencies"
+      # NO ZFS here — this tier validates only the LUKS/Clevis/Tang layer on a
+      # loopback device.  zfsutils-linux/zfs-initramfs are deliberately omitted
+      # (they would pull zfs-dkms and try to build a kernel module the container
+      # has no headers for); the role skips them too via clevis_install_zfs_packages.
       ansible.builtin.apt:
         name:
           - cryptsetup
           - dmsetup
           - util-linux
-          - zfsutils-linux
           - clevis
           - clevis-luks
           - tang
@@ -62,14 +65,27 @@
           ListenStream=127.0.0.1:{{ tang_port }}
 
     - name: "Generate Tang signing keys (once)"
+      # tang 15 (Debian 13) ships its binaries in the tang-common package under
+      # /usr/libexec (NOT on $PATH), so `command -v tangd-keygen` and
+      # `dpkg -L tang | grep tangd-keygen` both miss it.  Locate it robustly:
+      # PATH first, then the tang/tang-common file lists, then a direct search.
+      # tangd only serves keys already present in /var/db/tang — it never
+      # generates them, so this step must succeed before the /adv probe below.
       ansible.builtin.shell:
         cmd: |
           set -eo pipefail
-          kg=$(command -v tangd-keygen 2>/dev/null || dpkg -L tang | grep -m1 'tangd-keygen$')
+          kg=$(command -v tangd-keygen 2>/dev/null || true)
+          [ -n "$kg" ] || kg=$(dpkg -L tang tang-common 2>/dev/null | grep -m1 '/tangd-keygen$' || true)
+          [ -n "$kg" ] || kg=$(find /usr/libexec /usr/lib /usr/bin -name tangd-keygen 2>/dev/null | head -n1)
+          [ -n "$kg" ] || { echo "tangd-keygen not found" >&2; exit 1; }
           mkdir -p /var/db/tang
-          ls /var/db/tang/*.jwk >/dev/null 2>&1 || "$kg" /var/db/tang
+          if ! ls /var/db/tang/*.jwk >/dev/null 2>&1; then
+            "$kg" /var/db/tang
+            echo CHANGED
+          fi
         executable: /bin/bash
-      changed_when: true
+      register: _tang_keygen
+      changed_when: "'CHANGED' in _tang_keygen.stdout"
 
     - name: "Enable + (re)start tangd.socket"
       ansible.builtin.systemd:
@@ -93,10 +109,36 @@
       args:
         creates: /tmp/luks_test.img
 
+    - name: "Ensure a range of loop device nodes exists (no udev in the container)"
+      # The geerlingguy systemd image ships no loop device nodes and has no udev
+      # to create them on demand, so create them by hand.  Create a RANGE, not
+      # just loop0: the role uses loop0, but files/harness-unlock-o.sh grabs its
+      # own device via `losetup -f --show`, which returns the next free number
+      # (loop1) — and losetup cannot attach to a node that does not exist.
+      #
+      # Requires the MKNOD capability AND a ROOTFUL container runtime: rootless
+      # podman runs in a user namespace where the kernel forbids block-device
+      # mknod ("Operation not permitted"), so this LUKS-on-loopback tier must run
+      # under rootful docker/podman (e.g. CI).  loop major = 7, minor = N.
+      ansible.builtin.command: "mknod -m 0660 /dev/loop{{ item }} b 7 {{ item }}"
+      args:
+        creates: "/dev/loop{{ item }}"
+      loop: "{{ range(0, 8) | list }}"
+      loop_control:
+        label: "/dev/loop{{ item }}"
+
+    - name: "Check whether the test image is already attached to a loop device"
+      # losetup's own `creates: /dev/loop0` guard is wrong now that the node is
+      # pre-created above (it would skip the attach).  Guard on the actual
+      # association instead so this stays idempotent across re-converges.
+      ansible.builtin.command: losetup -j /tmp/luks_test.img
+      register: _loop_assoc
+      changed_when: false
+
     - name: "Attach backing file as /dev/loop0"
       ansible.builtin.command: losetup /dev/loop0 /tmp/luks_test.img
-      args:
-        creates: /dev/loop0
+      when: "'/dev/loop0' not in _loop_assoc.stdout"
+      changed_when: true
 
     - name: "Write the LUKS passphrase to a key file"
       ansible.builtin.copy:

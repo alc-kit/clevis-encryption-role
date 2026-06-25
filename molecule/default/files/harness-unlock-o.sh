@@ -34,7 +34,12 @@ info "loop device = $DEV"
 head -c 64 /dev/urandom > "$KEYFILE"; chmod 600 "$KEYFILE"
 cryptsetup luksFormat --type luks2 --batch-mode --pbkdf pbkdf2 --pbkdf-force-iterations 1000 "$DEV" "$KEYFILE"
 
-keygen=$(command -v tangd-keygen 2>/dev/null || dpkg -L tang 2>/dev/null | grep -m1 'tangd-keygen$')
+# tang 15 (Debian 13) ships binaries in the tang-common package under /usr/libexec
+# (off $PATH), so locate tangd-keygen robustly: PATH, then tang/tang-common file
+# lists, then a direct search.
+keygen=$(command -v tangd-keygen 2>/dev/null || true)
+[ -n "$keygen" ] || keygen=$(dpkg -L tang tang-common 2>/dev/null | grep -m1 '/tangd-keygen$' || true)
+[ -n "$keygen" ] || keygen=$(find /usr/libexec /usr/lib /usr/bin -name tangd-keygen 2>/dev/null | head -n1)
 mkdir -p /var/db/tang
 ls /var/db/tang/*.jwk >/dev/null 2>&1 || { [ -n "$keygen" ] && "$keygen" /var/db/tang >/dev/null 2>&1; }
 systemctl restart tangd.socket 2>/dev/null || true; sleep 1

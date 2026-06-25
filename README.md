@@ -63,6 +63,7 @@ automation:
 | `clevis_encryption_enabled` | `true` | Set `false` to skip the entire role. Useful when the role is included unconditionally in a playbook but encryption is not needed on every host. |
 | `clevis_pool_name` | `"data"` | Name of the ZFS pool created on top of the encrypted devices. |
 | `clevis_zfs_pool_topology` | `"mirror"` | Vdev layout. See [ZFS pool topology](#zfs-pool-topology). |
+| `clevis_install_zfs_packages` | `true` | Install the ZFS userland + initramfs integration (`zfsutils-linux`, `zfs-initramfs`) during prestage. ZFS is the higher-level consumer of the LUKS/Clevis devices, so its packages are a separable concern — set `false` when another role/base image already owns ZFS, or in environments that cannot build the ZFS kernel module (e.g. the container test). Does **not** create a pool; that is `clevis_ensure_pool`. |
 | `clevis_vault_password_file` | `"~/.ansible_vault_pass"` | Path to the Ansible Vault password file on the controller, used to encrypt the per-host recovery key. |
 | `clevis_keep_temp_key` | `false` | Retain `/tmp/ansible_luks_key` on the remote host after provisioning. Leave `false` in production. |
 | `clevis_destroy_existing` | `false` | Destroy an existing ZFS pool before (re-)provisioning. **Destructive.** |

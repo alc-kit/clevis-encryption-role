@@ -40,6 +40,17 @@ clevis_destroy_existing: false
 #   stripe  — no redundancy; all disks striped (data loss on any single disk).
 clevis_zfs_pool_topology: "mirror"
 
+# ── ZFS layer (packages) ──────────────────────────────────────────────────────
+# Install the ZFS userland + initramfs integration (zfsutils-linux,
+# zfs-initramfs) during prestage.  ZFS is the higher-level consumer of the
+# LUKS+Clevis devices this role provisions, so its packages are a separable
+# concern: set false when another role/base image already owns ZFS, or in
+# environments that cannot build the ZFS kernel module — notably the Molecule
+# container test, which validates only the LUKS/Clevis/Tang layer on a loopback
+# device and never touches zpool.  (Leaving this true is the production default;
+# it does NOT create a pool — that is governed by clevis_ensure_pool below.)
+clevis_install_zfs_packages: true
+
 # ── Pool management ───────────────────────────────────────────────────────────
 # ensure-pool.yml opens the LUKS mappers and creates/imports the ZFS pool when
 # missing.  It runs on every full invocation (outside the recovery-key-gated

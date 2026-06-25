@@ -52,8 +52,10 @@ provisioner:
         clevis_curl_ip_version: auto
         clevis_register_proxmox_storage: false
         clevis_vault_password_file: "/dev/null"
-        # Skip ensure-pool: the container has no usable ZFS kernel module, and
-        # this scenario only tests the boot-ordering block.
+        # ZFS is the higher-level consumer of the LUKS/Clevis devices and is out
+        # of scope for the container test (it cannot build the ZFS kernel module).
+        # Skip both the ZFS package install (prestage) and pool management.
+        clevis_install_zfs_packages: false
         clevis_ensure_pool: false
 
 verifier:
