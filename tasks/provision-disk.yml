@@ -90,7 +90,7 @@
   delay: 5
   changed_when: tang_verify.rc == 0
   environment:
-    PATH: "{{ ansible_env.PATH }}:/usr/bin:/usr/local/bin"
+    PATH: "{{ ansible_facts.env.PATH }}:/usr/bin:/usr/local/bin"
     # clevis-decrypt-tang curls the recovery endpoint; pin the IP family.
     CURL_HOME: "{{ clevis_curl_home }}"
   when: disk_is_luks.rc != 0
