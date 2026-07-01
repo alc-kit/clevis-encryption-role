@@ -1,0 +1,15 @@
+---
+# Provision the encrypted host: apply the clevis-encryption role for real —
+# LUKS2-format vdb/vdc, clevis-bind them to the EXTERNAL Tang (clevis-tang VM),
+# create the ZFS mirror, and lay down the boot-ordering units.  The provisioning
+# block runs because prepare.yml removed the controller-side recovery-key file
+# (the gate), unlike the Tier-0/1 scenarios where it is pre-created to skip it.
+#
+# Only the target is converged; the Tang VM is infrastructure, not under test.
+- name: "Converge (provision LUKS + ZFS + boot ordering)"
+  hosts: clevis-target
+  become: true
+  gather_facts: true
+
+  roles:
+    - role: clevis_encryption

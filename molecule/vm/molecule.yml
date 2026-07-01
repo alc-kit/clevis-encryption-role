@@ -1,0 +1,104 @@
+---
+# Tier-2 (VM boot-ordering) scenario on Vagrant + libvirt/KVM.
+#
+# Proves the one thing the cheaper tiers cannot: the role's REAL boot chain — the
+# data disks are unlocked at BOOT from an EXTERNAL Tang over the network, the
+# decoupled import -> pool-check -> ready.target chain runs, and allow_discards
+# survives a reboot.  A container has no initramfs, no real network-online
+# sequencing, and cannot reboot; this tier boots real VMs, provisions LUKS+ZFS,
+# reboots, and asserts the live boot chain.
+#
+# Topology — two VMs on Vagrant's NAT management network:
+#   clevis-tang   : the EXTERNAL Tang server, deliberately OFF the encrypted host
+#   clevis-target : two blank data disks (vdb,vdc) -> LUKS2 -> a ZFS mirror
+# The target reaches Tang over the shared NAT network.  Guest<->guest traffic is
+# pure L2 bridging, so the host firewall is not involved (unlike guest->host,
+# which firewalld blocks) — this is why Tang lives in its own VM rather than a
+# host container.  Rootless via the libvirt group + qemu_use_session=false, and
+# cachier disabled to avoid NFS synced folders — see molecule/default for the
+# full rationale.
+dependency:
+  name: galaxy
+
+driver:
+  name: vagrant
+  provider:
+    name: libvirt
+  # See molecule/default: the debian/trixie64 box + vagrant-cachier both default
+  # to NFS synced folders, whose /etc/exports edit needs root.  Disable cachier;
+  # /vagrant is already disabled by the driver default (synced_folder: false).
+  cachier: disabled
+
+platforms:
+  # ── EXTERNAL Tang server (no data disks, minimal resources) ───────────────
+  - name: clevis-tang
+    box: debian/trixie64
+    memory: 1024
+    cpus: 1
+    provider_options:
+      qemu_use_session: false
+
+  # ── Encrypted host: two data disks -> LUKS2 -> ZFS mirror, then rebooted ──
+  - name: clevis-target
+    box: debian/trixie64
+    memory: 3072
+    cpus: 2
+    provider_options:
+      qemu_use_session: false
+    # Two blank 2 GB virtio disks -> /dev/vdb and /dev/vdc (vda is the box root).
+    provider_raw_config_args:
+      - "storage :file, :size => '2G', :type => 'qcow2', :bus => 'virtio', :device => 'vdb'"
+      - "storage :file, :size => '2G', :type => 'qcow2', :bus => 'virtio', :device => 'vdc'"
+
+provisioner:
+  name: ansible
+  config_options:
+    defaults:
+      interpreter_python: auto_silent
+  inventory:
+    host_vars:
+      clevis-target:
+        # The external Tang lives in the clevis-tang VM; reach it at that guest's
+        # NAT IP (molecule sets ansible_host to the vagrant ssh HostName = the
+        # guest IP).  Templated at run time from the sibling host's facts.
+        tang_servers:
+          - url: "http://{{ hostvars['clevis-tang'].ansible_host }}:7500"
+        # Two blank data disks -> LUKS2 -> a ZFS mirror (real provisioning).
+        clevis_raw_disks:
+          - vdb
+          - vdc
+        clevis_pool_name: data
+        clevis_zfs_pool_topology: mirror
+        # Probe IPv4/IPv6 and pin the family that serves a valid advertisement.
+        # The Tang URL is an IPv4 literal, so the --ipv6 probe cannot succeed and
+        # the auto-probe deterministically pins --ipv4 — the same path Tier-0/1 hit.
+        clevis_curl_ip_version: auto
+        # Provisioning MUST run here (unlike Tier-0/1): the recovery-key file is
+        # removed on the controller by prepare.yml so the gate opens, the role
+        # LUKS-formats the disks, clevis-binds them, and creates the ZFS pool.
+        # Both live under a dedicated controller dir (NOT directly in /tmp): the
+        # role chmods dirname(recovery_key_path) to 0700, which fails on /tmp itself.
+        clevis_recovery_key_path: /tmp/molecule-vm-secrets/recovery-key.txt
+        clevis_vault_password_file: /tmp/molecule-vm-secrets/vault-pass
+        clevis_install_zfs_packages: true
+        clevis_ensure_pool: true
+        clevis_register_proxmox_storage: false
+
+scenario:
+  # create -> prepare -> converge (provision) -> side_effect (REBOOT) -> verify.
+  # Idempotence is intentionally omitted: this is a one-shot provisioning + boot
+  # test, and the reboot (side_effect) is the whole point.  dependency and cleanup
+  # are omitted too (collections are installed outside molecule; no cleanup
+  # playbook) so `molecule test` emits no "Missing playbook/requirements" warnings.
+  test_sequence:
+    - destroy
+    - syntax
+    - create
+    - prepare
+    - converge
+    - side_effect
+    - verify
+    - destroy
+
+verifier:
+  name: ansible
