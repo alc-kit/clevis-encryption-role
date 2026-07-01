@@ -7,7 +7,7 @@
 # module (enable `contrib`, install the DKMS build chain + matching headers, then
 # install and load ZFS).  The clevis-encryption role itself — clevis install,
 # LUKS format/bind, boot-ordering units — is applied afterwards over SSH by
-# tests/vm/playbook.yml, which is the actual thing under test.
+# manual_test/playbook.yml, which is the actual thing under test.
 hostname: clevis-vm
 ssh_pwauth: false
 users:

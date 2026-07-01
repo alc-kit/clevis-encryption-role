@@ -1,0 +1,255 @@
+---
+# Sets up the VM before the role is applied.  Tier-1 (VM) test: the LUKS/Clevis
+# keyslot layer on a REAL virtio disk — NO ZFS, NO reboot (that is Tier-2).
+#
+# What this does:
+#   1. Installs LUKS/clevis/tang/jose tooling.
+#   2. Stands up a LOCAL Tang on 127.0.0.1:7500 (IPv4-only — makes the role's
+#      `clevis_curl_ip_version: auto` probe deterministically resolve to ipv4).
+#   3. LUKS2-formats the real data disk /dev/vdb, clevis-binds it to the local
+#      Tang, and opens it as crypt-vdb (so configure-disk's live-discard apply
+#      has a real clevis-bound, open mapper to refresh).
+#   4. PLANTS legacy artifacts — both role-OWNED (carry the ownership header or a
+#      distinctive signature) and FOREIGN look-alikes (same name, no signature) —
+#      so verify.yml can prove cleanup-legacy removes ours and preserves theirs.
+#   5. Writes a fake recovery key so the provisioning block is skipped (only
+#      cleanup + prestage + boot-ordering run; provisioning needs ZFS).
+#
+# The clevis unlock -o / refresh behaviour itself is validated by the vendored
+# files/harness-unlock-o.sh, run from verify.yml against its OWN loop device.
+#
+# Unlike the old Docker container this runs on a real VM: /dev/vdb is a genuine
+# virtio block device, so there is no mknod / losetup / loop-node plumbing — the
+# kernel loop module and udev are present for the harness's own dedicated loop.
+
+- name: "Prepare VM for clevis-encryption Molecule test"
+  hosts: all
+  gather_facts: false
+  become: true
+
+  vars:
+    tang_port: 7500
+
+  tasks:
+
+    - name: "Install test dependencies"
+      # NO ZFS here — this tier validates only the LUKS/Clevis/Tang layer on a
+      # real virtio disk.  zfsutils-linux/zfs-initramfs are deliberately omitted
+      # (they would pull zfs-dkms and try to build a kernel module); the role
+      # skips them too via clevis_install_zfs_packages.
+      ansible.builtin.apt:
+        name:
+          - cryptsetup
+          - dmsetup
+          - util-linux
+          - clevis
+          - clevis-luks
+          - tang
+          - jose
+          - jq
+          - curl
+          - keyutils
+        state: present
+        update_cache: true
+
+    # ── Local Tang on 127.0.0.1:7500 (IPv4-only) ─────────────────────────────
+    - name: "Create tangd.socket drop-in directory"
+      ansible.builtin.file:
+        path: /etc/systemd/system/tangd.socket.d
+        state: directory
+        mode: '0755'
+
+    - name: "Pin tangd.socket to IPv4 loopback port {{ tang_port }}"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/tangd.socket.d/listen.conf
+        mode: '0644'
+        content: |
+          [Socket]
+          ListenStream=
+          ListenStream=127.0.0.1:{{ tang_port }}
+
+    - name: "Generate Tang signing keys (once)"
+      # tang 15 (Debian 13) ships its binaries in the tang-common package under
+      # /usr/libexec (NOT on $PATH), so `command -v tangd-keygen` and
+      # `dpkg -L tang | grep tangd-keygen` both miss it.  Locate it robustly:
+      # PATH first, then the tang/tang-common file lists, then a direct search.
+      # tangd only serves keys already present in /var/db/tang — it never
+      # generates them, so this step must succeed before the /adv probe below.
+      ansible.builtin.shell:
+        cmd: |
+          set -eo pipefail
+          kg=$(command -v tangd-keygen 2>/dev/null || true)
+          [ -n "$kg" ] || kg=$(dpkg -L tang tang-common 2>/dev/null | grep -m1 '/tangd-keygen$' || true)
+          [ -n "$kg" ] || kg=$(find /usr/libexec /usr/lib /usr/bin -name tangd-keygen 2>/dev/null | head -n1)
+          [ -n "$kg" ] || { echo "tangd-keygen not found" >&2; exit 1; }
+          mkdir -p /var/db/tang
+          if ! ls /var/db/tang/*.jwk >/dev/null 2>&1; then
+            "$kg" /var/db/tang
+            echo CHANGED
+          fi
+        executable: /bin/bash
+      register: _tang_keygen
+      changed_when: "'CHANGED' in _tang_keygen.stdout"
+
+    - name: "Enable + (re)start tangd.socket"
+      ansible.builtin.systemd:
+        name: tangd.socket
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    - name: "Wait for Tang to answer /adv"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ tang_port }}/adv"
+        status_code: 200
+      register: _tang_adv
+      retries: 10
+      delay: 1
+      until: _tang_adv.status == 200
+
+    # ── Real virtio LUKS2 data disk, clevis-bound to the local Tang ───────────
+    - name: "Confirm the data disk /dev/vdb is present"
+      # The libvirt provider attached this as an extra blank virtio disk in
+      # molecule.yml.  Fail early with a clear message if it is missing rather
+      # than letting cryptsetup emit a cryptic error.
+      ansible.builtin.stat:
+        path: "/dev/vdb"
+      register: _data_disk
+
+    - name: "Fail if the data disk is absent"
+      ansible.builtin.assert:
+        that: _data_disk.stat.exists
+        fail_msg: >-
+          /dev/vdb is not present — the libvirt extra disk was not
+          attached (check provider_raw_config_args in molecule.yml).
+
+    - name: "Write the LUKS passphrase to a key file"
+      ansible.builtin.copy:
+        dest: /root/molecule_luks.key
+        content: "molecule-test"
+        mode: '0600'
+
+    - name: "Format /dev/vdb as LUKS2 (fast pbkdf for tests)"
+      ansible.builtin.command: >-
+        cryptsetup luksFormat --type luks2 --batch-mode
+        --pbkdf pbkdf2 --pbkdf-force-iterations 1000
+        /dev/vdb /root/molecule_luks.key
+      args:
+        creates: "/dev/mapper/crypt-vdb"
+
+    - name: "Check whether /dev/vdb is already clevis-bound"
+      ansible.builtin.command: "clevis luks list -d /dev/vdb"
+      register: _clevis_list
+      changed_when: false
+      failed_when: false
+
+    - name: "Clevis-bind /dev/vdb to the local Tang"
+      ansible.builtin.shell:
+        cmd: >-
+          clevis luks bind -y -d /dev/vdb -k /root/molecule_luks.key
+          tang '{"url":"http://127.0.0.1:{{ tang_port }}"}'
+        executable: /bin/bash
+      when: "'tang' not in (_clevis_list.stdout | default(''))"
+      changed_when: true
+
+    - name: "Open LUKS device as crypt-vdb (no discard yet — role applies it)"
+      ansible.builtin.command: >-
+        cryptsetup luksOpen --key-file /root/molecule_luks.key
+        /dev/vdb crypt-vdb
+      args:
+        creates: "/dev/mapper/crypt-vdb"
+
+    # ── Plant legacy artifacts for the cleanup-legacy content-guard test ──────
+    # OWNED (must be REMOVED): carry the ownership header or a distinctive
+    # signature this role always wrote.
+    - name: "Plant OWNED legacy unit dirs"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/systemd/system/clevis-luks-askpass.service.wants
+        - /etc/systemd/system/zfs-import-cache.service.d
+        - /etc/systemd/system/zfs-import-scan.service.d
+        - /etc/systemd/system/networking.service.d
+
+    - name: "Plant OWNED clevis-network-ready.service (Tier 1: by-name)"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/clevis-network-ready.service
+        mode: '0644'
+        content: |
+          # Managed by Ansible role: clevis_encryption — https://github.com/KvalitetsIT/clevis-encryption-role
+          [Unit]
+          Description=LEGACY clevis-network-ready (planted by molecule prepare)
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/bin/true
+          [Install]
+          WantedBy=clevis-luks-askpass.service
+
+    - name: "Plant OWNED clevis-network-ready .wants symlink"
+      ansible.builtin.file:
+        src: /etc/systemd/system/clevis-network-ready.service
+        dest: /etc/systemd/system/clevis-luks-askpass.service.wants/clevis-network-ready.service
+        state: link
+        force: true
+
+    - name: "Plant /etc/gai.conf with the OWNED ipv4-only block + UNRELATED operator content"
+      ansible.builtin.copy:
+        dest: /etc/gai.conf
+        mode: '0644'
+        content: |
+          # operator content that MUST survive cleanup
+          label ::1/128 0
+          # BEGIN ANSIBLE MANAGED clevis-encryption ipv4-only
+          precedence ::ffff:0:0/96  100
+          precedence ::/0           1
+          # END ANSIBLE MANAGED clevis-encryption ipv4-only
+
+    - name: "Plant OWNED zfs-import-cache override.conf (signature: clevis-unlock-data)"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/zfs-import-cache.service.d/override.conf
+        mode: '0644'
+        content: |
+          [Unit]
+          Requires=clevis-unlock-data.service
+          After=clevis-unlock-data.service
+
+    - name: "Plant OWNED networking 10-override.conf (signature: ifupdown2-pre.service sysinit.target)"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/networking.service.d/10-override.conf
+        mode: '0644'
+        content: |
+          [Unit]
+          After=network-pre.target apparmor.service ifupdown2-pre.service sysinit.target
+
+    - name: "Plant OWNED 99-ipv6_disable.conf (signature: disable_ipv6)"
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-ipv6_disable.conf
+        mode: '0644'
+        content: |
+          net.ipv6.conf.default.disable_ipv6 = 1
+          net.ipv6.conf.all.disable_ipv6 = 1
+
+    # FOREIGN (must be PRESERVED): same name, no role signature/header.
+    - name: "Plant FOREIGN zfs-import-scan override.conf (no signature — must survive)"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/zfs-import-scan.service.d/override.conf
+        mode: '0644'
+        content: |
+          [Service]
+          Nice=-5
+
+    - name: "Reload systemd so it sees the planted units before converge"
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    # ── Skip the provisioning block (it needs ZFS) ───────────────────────────
+    - name: "Create fake recovery key so provisioning block is skipped"
+      ansible.builtin.copy:
+        dest: /tmp/molecule_recovery_key.txt
+        content: "molecule-test-recovery-key\n"
+        mode: '0600'
+      delegate_to: localhost
+      become: false

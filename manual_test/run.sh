@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# tests/vm/run.sh — Tier-2 VM test: prove the clevis-encryption role's REAL boot
+# manual_test/run.sh — Tier-2 VM test: prove the clevis-encryption role's REAL boot
 # ordering and network unlock, which a container cannot.
 #
 # Topology (Option B — unprivileged, GitHub-runner friendly):
@@ -8,8 +8,8 @@
 #     published to host loopback (127.0.0.1:7500);
 #   - a throwaway Debian 13 VM under QEMU/KVM with two blank data disks, reaching
 #     Tang over the network via QEMU's slirp gateway (10.0.2.2 -> host loopback);
-#   - the role is applied over SSH by tests/vm/playbook.yml, then the VM is
-#     REBOOTED and tests/vm/verify.yml asserts the boot chain actually fired.
+#   - the role is applied over SSH by manual_test/playbook.yml, then the VM is
+#     REBOOTED and manual_test/verify.yml asserts the boot chain actually fired.
 #
 # No root, no bridges, no libvirt: only a published container port + QEMU slirp.
 # Falls back to TCG if /dev/kvm is unavailable (slow — KVM strongly preferred).
@@ -24,7 +24,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="$(cd "$HERE/../.." && pwd)"
+REPO="$(cd "$HERE/.." && pwd)"
 RUNDIR="$HERE/.run"            # all generated artifacts (gitignored)
 mkdir -p "$RUNDIR"
 
@@ -177,7 +177,7 @@ do_test(){
   local tang_eopt=()
   [ "$TANG_PORT" = "7500" ] || tang_eopt=(-e "{\"tang_servers\":[{\"url\":\"$TANG_URL_GUEST\"}]}")
 
-  say "applying the role over SSH (tests/vm/playbook.yml)"
+  say "applying the role over SSH (manual_test/playbook.yml)"
   ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i "$INV" "$HERE/playbook.yml" \
     -e "clevis_recovery_key_path=$RECKEY" \
     -e "clevis_vault_password_file=$VAULTPASS" \
@@ -202,7 +202,7 @@ do_test(){
   say "boot-2 chain status + clevis-unlock-data journal:"
   vm_ssh 'for u in clevis-unlock-data.service encrypted-storage-import.service encrypted-storage-pool-check.service encrypted-storage-ready.target; do printf "  %-40s %s\n" "$u" "$(systemctl is-active "$u" 2>/dev/null)"; done; echo "--- clevis-unlock-data journal ---"; journalctl -b -u clevis-unlock-data.service --no-pager | tail -25' || true
 
-  say "verifying boot-time unlock + ordering (tests/vm/verify.yml)"
+  say "verifying boot-time unlock + ordering (manual_test/verify.yml)"
   ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i "$INV" "$HERE/verify.yml"
 
   say "VM BOOT-ORDERING TEST PASSED ✅"

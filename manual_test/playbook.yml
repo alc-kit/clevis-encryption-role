@@ -3,7 +3,7 @@
 # host that has two blank data disks, binding the unlock to an EXTERNAL Tang
 # server reached over the network.
 #
-# This is BOTH the driver for the VM boot-ordering test (tests/vm/run.sh) and a
+# This is BOTH the driver for the VM boot-ordering test (manual_test/run.sh) and a
 # copy-paste example for real deployments. For real use, set tang_servers to your
 # Tang URLs, clevis_raw_disks to your data disks, and clevis_vault_password_file
 # to a real vault password file. run.sh overrides a few of these via -e for the

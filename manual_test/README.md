@@ -1,14 +1,34 @@
-# Tier-2 VM boot-ordering test
+# Manual boot-ordering test (raw QEMU/KVM — portable fallback)
 
-Proves the one thing the Molecule container scenarios cannot: that the role's
-**boot ordering** actually works — the data disks are unlocked at boot from an
-**external** Tang over the network, the decoupled import chain runs, and
-`allow_discards` survives a reboot.
+This is a **self-contained, dependency-light** version of the Tier-2 boot-ordering
+test. It proves the same thing as the `molecule/vm` scenario — that the role's
+data disks are unlocked **at boot** from an **external** Tang over the network,
+the decoupled import chain runs, and `allow_discards` survives a reboot — but it
+does so with **raw QEMU + a container**, needing **no libvirt, no Vagrant, and no
+root**.
 
-A container can never test this: there is no initramfs, no real
-`network-online.target` sequencing, and no reboot. So this tier boots a real
-Debian 13 VM under QEMU/KVM, applies the role, **reboots**, and asserts the live
-boot chain.
+## Why this exists alongside `molecule/vm`
+
+The CI Tier-2 test (`molecule/vm`) uses **Vagrant + libvirt/KVM**. That is the
+right tool on a workstation or a GitHub runner where libvirt is available, but it
+carries real dependencies: `libvirtd`, the `vagrant-libvirt` plugin, membership
+of the `libvirt` group, and a second VM for Tang.
+
+This manual harness deliberately keeps **zero** of those dependencies. It uses:
+
+- `qemu-system-x86_64` directly with **user-mode / slirp** networking — the guest
+  gets a fixed `10.0.2.15` and reaches the host via `10.0.2.2`, so there are no
+  bridges and no libvirt networks — and
+- a **container** (docker or podman) for the external Tang, published to host
+  loopback.
+
+That makes it the portable fallback for the day this project moves **off GitHub**
+(or onto any CI/host without libvirt) — it will run on anything with QEMU + a
+container runtime, rootless. It is **not** wired into CI; run it by hand.
+
+> If you have libvirt available, prefer `molecule test -s vm` (see the repo
+> README "Testing" section). This harness is the escape hatch, kept current so it
+> is ready if the libvirt path ever becomes unavailable.
 
 ## Topology (unprivileged, GitHub-runner friendly)
 
@@ -29,16 +49,16 @@ boot chain.
 
 Tang lives **off the VM** so the unlock genuinely exercises the network path the
 boot ordering exists for. No root, no bridges, no libvirt — only a published
-container port and QEMU's slirp gateway. Falls back to TCG if `/dev/kvm` is
-absent (slow; KVM strongly preferred).
+container port and QEMU's slirp gateway. Falls back to TCG if `/dev/kvm` is absent
+(slow; KVM strongly preferred).
 
 ## Run
 
 ```bash
-tests/vm/run.sh test        # full: Tang + build + boot + apply + reboot + verify
-tests/vm/run.sh up          # just start Tang + boot the VM (then ssh in)
-tests/vm/run.sh teardown    # stop VM + Tang, remove overlays (keep base cache)
-tests/vm/run.sh clean       # also remove the cached base image
+manual_test/run.sh test        # full: Tang + build + boot + apply + reboot + verify
+manual_test/run.sh up          # just start Tang + boot the VM (then ssh in)
+manual_test/run.sh teardown    # stop VM + Tang, remove overlays (keep base cache)
+manual_test/run.sh clean       # also remove the cached base image
 ```
 
 ### Requirements (host / control)
@@ -51,7 +71,7 @@ tests/vm/run.sh clean       # also remove the cached base image
 - access to `/dev/kvm` for acceleration (optional but strongly recommended)
 
 All generated artifacts (base image, overlays, seed ISO, SSH key, serial log)
-live under `tests/vm/.run/` and are gitignored.
+live under `manual_test/.run/` and are gitignored.
 
 ## What it asserts (`verify.yml`, after the reboot)
 
@@ -64,6 +84,9 @@ live under `tests/vm/.run/` and are gitignored.
 - `clevis-unlock-data` logged a successful unlock (network unlock from the
   external Tang).
 
+These are the same assertions as `molecule/vm/verify.yml` — the two tests are
+kept deliberately equivalent.
+
 ## Files
 
 | File | Purpose |
@@ -72,5 +95,3 @@ live under `tests/vm/.run/` and are gitignored.
 | `playbook.yml` | The role applied to the VM — also a copy-paste **reference playbook** for real deployments. |
 | `verify.yml` | Post-reboot assertions. |
 | `cloud-init/` | NoCloud seed: SSH access + platform prep so ZFS DKMS can build (out of the role's scope). |
-
-CI: `.github/workflows/vm-test.yml` runs this on `ubuntu-latest` (which has KVM).

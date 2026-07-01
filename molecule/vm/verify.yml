@@ -1,15 +1,16 @@
 ---
-# Post-REBOOT assertions for the VM boot-ordering test.  Run by tests/vm/run.sh
-# after the role has provisioned the disks and the VM has been rebooted, so these
-# checks observe the REAL systemd boot chain — not the provisioning run.
+# Post-REBOOT assertions for the Tier-2 VM boot-ordering test.  These observe the
+# REAL systemd boot chain (boot 2), not the provisioning run.
 #
 # What a green run proves end-to-end:
 #   - the data disks were unlocked at boot by clevis-unlock-data via the EXTERNAL
-#     Tang over the network (only possible after network-online.target);
+#     Tang (clevis-tang VM) over the network — only possible after
+#     network-online.target;
 #   - the decoupled import -> pool-check -> ready.target chain ran to completion;
-#   - allow_discards survived the reboot (durable open, not just the live-apply).
+#   - allow_discards survived the reboot (durable open, not just the live-apply);
+#   - the ZFS mirror imported and is healthy.
 - name: "Verify boot-time clevis/Tang unlock + boot ordering (post-reboot)"
-  hosts: all
+  hosts: clevis-target
   become: true
   gather_facts: false
 
@@ -65,6 +66,6 @@
     - name: "PASS"
       ansible.builtin.debug:
         msg: >-
-          VM boot-ordering test PASSED — both data disks unlocked at boot from the
-          external Tang, allow_discards durable across reboot, pool
+          Tier-2 VM boot-ordering test PASSED — both data disks unlocked at boot
+          from the external Tang, allow_discards durable across reboot, pool
           {{ _health.stdout }}, encrypted-storage-ready.target active.

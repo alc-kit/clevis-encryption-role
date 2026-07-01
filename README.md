@@ -394,57 +394,124 @@ superseded by the clevis-scoped `curlrc` — see
 
 ## Testing
 
-Testing is layered to match the stack — each tier proves what the cheaper tier
-below it cannot:
+Testing is layered to match the stack. **Tier 0** is cheap static + device-free
+validation that runs on every push; the VM tiers boot progressively more of the
+stack and run on a KVM-capable runner (or locally):
 
-| Tier | Where | Layer under test | Needs |
+| Tier | Layer under test | Where | Needs |
 |---|---|---|---|
-| 0 | `molecule/network` | clevis↔Tang **crypto + network** — the IP-family selection this role performs | **Rootless** podman/Docker; any CI |
-| 1 | `molecule/default` | **LUKS keyslot** — `clevis luks bind`/`unlock -o`, crypttab, durable `allow_discards` | **Rootful** container (loopback dev) |
-| 2 | `tests/vm/` | **Real boot ordering** — boot-time unlock from an external Tang, the decoupled import chain, reboot-durable discard | QEMU/KVM VM (+ a Tang container) |
+| 0 | **Repository validation** — `yamllint`, `ansible-lint`, `ansible-core` version syntax-check — **plus** the device-free clevis↔Tang **crypto + IP-family** check | `.yamllint`, `.ansible-lint`, `molecule/network` (`ci.yml`) | any runner (+ Docker for the crypto scenario) |
+| 1 | **LUKS keyslot** — `clevis luks bind`/`unlock -o`, crypttab, durable `allow_discards` | `molecule/default` (`vm-tests.yml`) | **Rootless** libvirt/KVM VM (user in `libvirt` group) |
+| 2 | **Real boot ordering** — boot-time unlock from an external Tang, the decoupled import chain, reboot-durable discard, ZFS on LUKS | `molecule/vm` (`vm-tests.yml`) | **Rootless** libvirt/KVM (two VMs: encrypted host + external Tang) |
 
-Tiers 0–1 are [Molecule](https://ansible.readthedocs.io/projects/molecule/)
-scenarios (Docker driver, privileged Debian 13 container with `systemd` as PID 1).
+The `network` scenario (Tier 0) is a
+[Molecule](https://ansible.readthedocs.io/projects/molecule/) scenario on the
+**Docker** driver (device-free, rootless — a privileged Debian 13 container with
+`systemd` as PID 1). Tiers 1–2 (`default`, `vm`) are Molecule scenarios on the
+**Vagrant + libvirt/KVM** driver, running real Debian 13 (`debian/trixie64`) VMs.
 The split mirrors how clevis works: `clevis encrypt`/`decrypt` round-trip with
 Tang over `curl` (the network layer — no disk, no privilege), while binding a key
 to a LUKS keyslot needs a real block device. The `network` scenario runs the
 **same role** device-free (`clevis_raw_disks: []`), so the network handling — the
 subject of `clevis_curl_ip_version` — is testable anywhere. Boot ordering can only
-be proven by a real boot + reboot, so it lives in the VM tier — see
-[`tests/vm/README.md`](tests/vm/README.md).
+be proven by a real boot + reboot, so it lives in the `vm` tier: two VMs on
+Vagrant's NAT network — the encrypted host (`vdb`+`vdc` → LUKS2 → a ZFS mirror)
+and a separate **external** Tang server it unlocks from at boot. Tang is its own
+VM because guest↔guest traffic is pure L2 bridging, whereas guest→host services
+are blocked by the host firewall.
 
-> **Why `default` needs rootful.** Setting up a loopback LUKS device requires
-> creating a `/dev/loop*` node and `CAP_SYS_ADMIN` against the initial namespace.
-> Rootless containers run in a user namespace where the kernel forbids
-> block-device `mknod`, so the `default` scenario must run under a rootful
-> runtime — e.g. CI with the Docker daemon, or `sudo`. The `network` scenario has
-> no such requirement.
+A **raw-QEMU fallback** of Tier 2 — no libvirt, no Vagrant, no root (user-mode
+QEMU networking + a Tang container) — lives in [`manual_test/`](manual_test/) for
+portability off GitHub or onto hosts without libvirt. It is run by hand, not in CI.
+
+> **Why `default` is a VM, not a container.** Binding a key to a LUKS keyslot
+> needs a real block device. The old Docker version faked one with a
+> loopback + `mknod` hack that required a *rootful* runtime (rootless user
+> namespaces forbid block-device `mknod`). The Vagrant + libvirt/KVM VM gives a
+> genuine virtio disk instead, and runs **rootless** wherever the invoking user
+> has system-libvirt access via the `libvirt` group (polkit) — no `sudo`. Vagrant
+> auto-creates and tears down its own `vagrant-libvirt` NAT network per run, so
+> there is no persistent host network to manage.
 
 ### Prerequisites
 
+Tier-0 validation — lint + the device-free crypto scenario:
+
 ```bash
-pip install molecule 'molecule-plugins[docker]' ansible
+pip install ansible-lint yamllint molecule 'molecule-plugins[docker]' ansible
 ansible-galaxy collection install community.docker ansible.posix
 ```
 
-A container runtime (Docker, or Podman exposing the Docker-compatible socket via
-`DOCKER_HOST`) must be available.
+`yamllint .` and `ansible-lint` need no runtime. The `network` scenario needs a
+container runtime (Docker, or Podman exposing the Docker-compatible socket via
+`DOCKER_HOST`).
+
+Tiers 1–2 (`default`, `vm`) — Vagrant + libvirt/KVM driver:
+
+```bash
+pip install molecule 'molecule-plugins[vagrant]' python-vagrant ansible
+ansible-galaxy collection install ansible.posix community.general
+# Host packages: libvirt + KVM + Vagrant + the vagrant-libvirt plugin, e.g.
+#   Fedora: sudo dnf install vagrant vagrant-libvirt libvirt qemu-kvm
+#   Debian: sudo apt install vagrant vagrant-libvirt libvirt-daemon-system qemu-kvm
+# Add yourself to the libvirt group (log out/in afterwards) so no sudo is needed:
+sudo usermod -aG libvirt "$USER"
+```
+
+Two environment variables are required for the VM tiers (see the note below on why):
+
+```bash
+# molecule-core 25.12 no longer auto-adds the vagrant driver's modules dir to
+# ANSIBLE_LIBRARY, so point at it explicitly (portable across install locations):
+export ANSIBLE_LIBRARY="$(python3 -c 'import molecule_plugins.vagrant, os; print(os.path.join(os.path.dirname(molecule_plugins.vagrant.__file__), "modules"))')"
+# Use system libvirt (vagrant-libvirt defaults to a session URI that cannot
+# provide the DHCP lease vagrant needs to discover the guest IP):
+export LIBVIRT_DEFAULT_URI=qemu:///system
+```
+
+> The scenario forces `qemu_use_session: false` (system libvirt) and disables
+> `vagrant-cachier` (`cachier: disabled`) in `molecule.yml`. Session mode has no
+> usermode/slirp support — vagrant-libvirt finds the guest IP only via a libvirt
+> DHCP lease — and both the `debian/trixie64` box and vagrant-cachier default to
+> **NFS** synced folders, whose `/etc/exports` edit needs root; disabling them
+> keeps the run rootless.
 
 ### Running the tests
 
 ```bash
 cd ansible/roles/clevis-encryption
 
-# Tier-0 — device-free, rootless: the network / IP-family behaviour
+# Tier-0 — repository validation (no runtime) + device-free crypto (Docker)
+yamllint .
+ansible-lint
 molecule test -s network
 
-# Tier-1 — loopback LUKS; needs a rootful runtime
-sudo molecule test            # the 'default' scenario
+# Tiers 1-2 — libvirt/KVM VMs (rootless via the libvirt group); both need:
+export ANSIBLE_LIBRARY="$(python3 -c 'import molecule_plugins.vagrant, os; print(os.path.join(os.path.dirname(molecule_plugins.vagrant.__file__), "modules"))')"
+export LIBVIRT_DEFAULT_URI=qemu:///system
+
+# Tier-1 — real virtio-disk LUKS keyslot layer (fast, no reboot)
+molecule test              # the 'default' scenario — no sudo
+
+# Tier-2 — real boot ordering: 2 VMs, ZFS-on-LUKS, provision + REBOOT + verify
+molecule test -s vm        # ~10 min: builds ZFS via DKMS, reboots the guest
 ```
 
 `molecule test` runs the full lifecycle (`create → prepare → converge →
-idempotence → verify → destroy`).  To iterate, use
+idempotence → verify → destroy`); the `vm` scenario swaps `idempotence` for a
+`side_effect` step that reboots the guest before `verify`.  To iterate, use
 `molecule converge -s <scenario>` then `molecule verify -s <scenario>`.
+
+### Continuous integration
+
+Two GitHub Actions workflows:
+
+- **`ci.yml`** (every push / PR): the Tier-0 gate — `yamllint`, `ansible-lint`,
+  an `ansible-core` version matrix syntax-check, and the device-free `network`
+  scenario (Docker). Cheap, no VMs.
+- **`vm-tests.yml`** (PRs touching role/test code, or manual dispatch): Tiers 1–2
+  (`default`, `vm`) on libvirt/KVM. It bootstraps libvirt + Vagrant +
+  `vagrant-libvirt` on the runner and needs nested KVM (`/dev/kvm`).
 
 ### What is tested
 
@@ -457,11 +524,11 @@ idempotence → verify → destroy`).  To iterate, use
 - the device-independent boot-ordering artifacts are deployed
   (the `clevis-luks-askpass` network-online gate and `clevis-unlock-data.service`)
 
-**`default`** (loopback LUKS):
+**`default`** (real virtio-disk LUKS):
 
-- `/etc/crypttab` has the expected `crypt-loop0` entry with `_netdev`,
+- `/etc/crypttab` has the expected `crypt-vdb` entry with `_netdev`,
   `x-systemd.after=network-online.target`, `discard`, and `nofail`
-- `/dev/mapper/crypt-loop0` is open and `discards` is active in the dm-crypt table
+- `/dev/mapper/crypt-vdb` is open and `discards` is active in the dm-crypt table
   (the live-apply path)
 - the auto-probe pinned `--ipv4` against the IPv4-only test Tang
 - the retired `gai.conf` block, `clevis-network-ready.service`, and
@@ -470,21 +537,33 @@ idempotence → verify → destroy`).  To iterate, use
 - a vendored harness proves `clevis luks unlock -o "--allow-discards"` and the
   live-refresh path land `allow_discards`
 
-In both Molecule scenarios the provisioning block (LUKS format on real disks,
-Clevis bind, ZFS pool creation) is skipped because `prepare.yml` pre-creates the
-recovery-key file — the same mechanism that prevents re-provisioning on live
-nodes.  ZFS is out of scope for the container tier (`clevis_install_zfs_packages:
-false`, `clevis_ensure_pool: false`); it is the higher-level consumer and is
-exercised for real in the **Tier-2 VM test** (`tests/vm/`), which provisions ZFS
-on LUKS and verifies the pool imports at boot.
+**`vm`** (real boot ordering, post-reboot):
 
-### How disk mocking works
+- both `crypt-vdb` / `crypt-vdc` mappers are open after boot with `allow_discards`
+  still set (durable across the reboot, not just the live-apply)
+- `clevis-unlock-data`, `encrypted-storage-import`, `encrypted-storage-pool-check`
+  all succeeded and `encrypted-storage-ready.target` is active (the boot barrier)
+- `clevis-unlock-data` logged a successful unlock — the disks were opened at boot
+  from the **external** Tang (the `clevis-tang` VM) over the network
+- the ZFS mirror imported and is `ONLINE`
+
+In the `network` and `default` scenarios the provisioning block (LUKS format on
+real disks, Clevis bind, ZFS pool creation) is **skipped** because `prepare.yml`
+pre-creates the recovery-key file — the same mechanism that prevents
+re-provisioning on live nodes — and ZFS is out of scope there
+(`clevis_install_zfs_packages: false`, `clevis_ensure_pool: false`).  The `vm`
+scenario is the opposite: `prepare.yml` *removes* the recovery-key gate so the
+role provisions for real — it formats the disks, binds Clevis, builds the ZFS
+mirror, then reboots and verifies the pool imports at boot.
+
+### How disk selection works
 
 `tasks/main.yml`'s disk-discovery task carries `when: clevis_raw_disks is not
-defined`.  The `default` scenario pre-sets `clevis_raw_disks: [loop0]` (the
-loopback LUKS device); the `network` scenario sets `clevis_raw_disks: []` so the
-per-disk loops are empty and nothing touches a block device.  Either way the role
-never inspects `ansible_devices`, which is unreliable in containers.
+defined`.  The `default` scenario pre-sets `clevis_raw_disks: [vdb]` and the `vm`
+scenario `[vdb, vdc]` — the extra virtio disks the libvirt provider attaches to
+the VM; the `network` scenario sets `clevis_raw_disks: []` so the per-disk loops
+are empty and nothing touches a block device.  Either way the role never inspects
+`ansible_devices`, which is unreliable in test substrates.
 
 ## Troubleshooting
 
