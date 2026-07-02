@@ -112,17 +112,97 @@
         state: present
         update_cache: true
 
-    - name: "Install ZFS (DKMS build + userland)"
-      ansible.builtin.apt:
-        name:
-          - zfs-dkms
-          - zfsutils-linux
-        state: present
+    # ── Pre-flight: fail fast + legibly on kernel/zfs-dkms drift ──────────────
+    # The real Tier-2 brittleness (see clevis-testing-harness-plan.md): a
+    # debian/trixie64 kernel bump ahead of contrib's zfs-dkms — OpenZFS <= 2.4.1
+    # will not build against a 7.0+ kernel.  Surface the running kernel + the
+    # zfs-dkms/header candidates BEFORE the minutes-long DKMS compile so a drift
+    # failure reads as "kernel X vs zfs-dkms Y", not a wall of gcc errors buried
+    # in apt's postinst output.  (apt-cache policy has no module equivalent.)
+    - name: "Pre-flight | resolve zfs-dkms + kernel-headers candidates"  # noqa: command-instead-of-module
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          # Emit "(none)" when apt-cache prints no Candidate line at all (package
+          # entirely absent — the tier2-01 "contrib not effective" case) so the
+          # assert below catches both "absent" and "no installable candidate".
+          cand() { apt-cache policy "$1" | awk '/Candidate:/{print $2; f=1} END{if(!f)print "(none)"}'; }
+          echo "kernel={{ ansible_facts.kernel }}"
+          echo "zfs-dkms=$(cand zfs-dkms)"
+          echo "headers=$(cand 'linux-headers-{{ ansible_facts.kernel }}')"
+        executable: /bin/bash
+      register: _zfs_candidates
+      changed_when: false
+      check_mode: false
+
+    - name: "Pre-flight | show resolved kernel/zfs-dkms/header versions"
+      ansible.builtin.debug:
+        var: _zfs_candidates.stdout_lines
+
+    - name: "Pre-flight | fail fast if zfs-dkms or matching headers are unavailable"
+      # Catches the tier2-01 class (contrib not effective -> no candidate) and a
+      # kernel/headers mismatch, before the compile, with an actionable message.
+      ansible.builtin.assert:
+        that:
+          - "'zfs-dkms=(none)' not in _zfs_candidates.stdout"
+          - "'headers=(none)' not in _zfs_candidates.stdout"
+        fail_msg: >-
+          ZFS DKMS prerequisites unavailable for kernel {{ ansible_facts.kernel }}.
+          Resolved: {{ _zfs_candidates.stdout | trim }}. The trixie kernel has
+          likely moved ahead of contrib's zfs-dkms (or matching headers). Pin the
+          box/kernel or bump zfs-dkms before retrying — see the OpenZFS/kernel-7.0
+          note in clevis-testing-harness-plan.md.
+        success_msg: >-
+          zfs-dkms + linux-headers-{{ ansible_facts.kernel }} both installable
+          ({{ _zfs_candidates.stdout | trim }}).
+
+    - name: "Install ZFS (DKMS build + userland), with drift diagnostics on failure"
+      # block/rescue so a DKMS *build* failure (kernel too new for this OpenZFS)
+      # surfaces the make.log tail instead of an opaque apt postinst error.
+      block:
+        - name: "Install ZFS (DKMS build + userland)"
+          ansible.builtin.apt:
+            name:
+              - zfs-dkms
+              - zfsutils-linux
+            state: present
+      rescue:
+        - name: "Collect the ZFS DKMS build log"  # noqa: command-instead-of-module
+          ansible.builtin.shell:
+            cmd: |
+              set -uo pipefail
+              echo "== dkms status =="; dkms status zfs 2>/dev/null || true
+              log=$(ls -1t /var/lib/dkms/zfs/*/build/make.log 2>/dev/null | head -n1 || true)
+              [ -n "$log" ] && { echo "== tail $log =="; tail -n 40 "$log"; }
+            executable: /bin/bash
+          register: _zfs_dkms_log
+          changed_when: false
+
+        - name: "Fail with ZFS DKMS build diagnostics"
+          ansible.builtin.fail:
+            msg: >-
+              zfs-dkms failed to build/install on kernel {{ ansible_facts.kernel }}.
+              Candidates were: {{ _zfs_candidates.stdout | trim }}.
+              DKMS diagnostics:
+              {{ _zfs_dkms_log.stdout | default('(none captured)') }}
 
     - name: "Load the ZFS kernel module"
       community.general.modprobe:
         name: zfs
         state: present
+
+    - name: "Verify the ZFS module loaded and userland is present"  # noqa: command-instead-of-module
+      # Proves the DKMS module actually built + loaded and matches userland —
+      # `modprobe` alone can succeed against a stale module; `zfs version` fails
+      # loudly if kmod/userland drifted.  No module equivalent.
+      ansible.builtin.command: zfs version
+      register: _zfs_version
+      changed_when: false
+      check_mode: false
+
+    - name: "Show the built ZFS version"
+      ansible.builtin.debug:
+        var: _zfs_version.stdout_lines
 
 # ── 3. Controller: vault password + fresh recovery-key gate ──────────────────
 - name: "Prepare the controller (vault pass + recovery-key gate)"

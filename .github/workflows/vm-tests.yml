@@ -4,10 +4,11 @@
 # so they are slow and gated on PRs touching role/test code + manual dispatch —
 # not every push.  GitHub-hosted ubuntu-latest exposes /dev/kvm.
 #
-# NOTE: the libvirt + Vagrant runner setup below follows the common pattern but
-# cannot be exercised by `act` (act containers have no nested KVM/libvirtd).  The
-# Molecule scenarios themselves are validated locally; the first real CI run may
-# need minor tuning of this bootstrap.
+# NOTE: this bootstrap is PROVEN on GitHub-hosted ubuntu-latest — both matrix
+# jobs pass with nested KVM (Tier-1 `default` ~4 min, Tier-2 `vm` ~11 min: 2 VMs,
+# ZFS-on-LUKS, reboot).  It still cannot be exercised by `act` locally (act
+# containers have no nested KVM/libvirtd), so validate changes here via a real
+# PR run or `workflow_dispatch`, not `act`.
 name: vm-tests
 
 on:
