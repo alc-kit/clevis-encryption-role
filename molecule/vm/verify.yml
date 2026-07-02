@@ -23,6 +23,14 @@
       changed_when: false
       failed_when: _ready.stdout != "active"
 
+    - name: "Assert clevis-luks-unlocked.target reached (public NBDE sync point)"  # noqa: command-instead-of-module
+      # The stable seam a split-out storage-pool consumer will order after; it
+      # must be active after boot (reached once the fail-degraded unlock ran).
+      ansible.builtin.command: systemctl is-active clevis-luks-unlocked.target
+      register: _unlocked
+      changed_when: false
+      failed_when: _unlocked.stdout != "active"
+
     - name: "Assert unlock + import + pool-check services all succeeded"  # noqa: command-instead-of-module
       ansible.builtin.command: "systemctl is-active {{ item }}"
       loop:
