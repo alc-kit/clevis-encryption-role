@@ -1,17 +1,15 @@
 ---
-# Tier-2 (VM) preparation, in three parts:
-#   1. clevis-tang   : stand up the EXTERNAL Tang server, reachable on the NAT
-#                      network at 0.0.0.0:7500 (so the target can reach it).
-#   2. clevis-target : platform prep that is OUT of the role's scope — make the
-#                      box able to build + load the ZFS kernel module (contrib +
-#                      DKMS chain + matching headers), mirroring the old
-#                      manual_test/cloud-init platform prep.
-#   3. controller    : generate a throwaway vault password and REMOVE any stale
+# Tier-2 (VM) preparation, in two parts:
+#   1. clevis-tang   : stand up the EXTERNAL Tang server on the NAT network.
+#   2. controller    : generate a throwaway vault password and REMOVE any stale
 #                      recovery key so the role's provisioning block runs fresh.
 #
-# The clevis-encryption role itself (clevis install, LUKS format/bind, ZFS pool,
-# boot-ordering units) is applied afterwards by converge.yml — that is the thing
-# under test, exercised for real and then across a reboot.
+# NOTE: no ZFS/DKMS platform prep any more. clevis runs NBDE-only; the downstream
+# consumer (encrypted_storage_pool, btrfs) installs its own mainline userland
+# (btrfs-progs) — no out-of-tree module, no kernel headers, no contrib.
+#
+# clevis_encryption (NBDE) + encrypted_storage_pool (btrfs) are applied by
+# converge.yml — that is the thing under test, exercised for real and across a reboot.
 
 # ── 1. External Tang server ──────────────────────────────────────────────────
 - name: "Prepare the external Tang server"
@@ -36,10 +34,9 @@
         mode: '0755'
 
     - name: "Bind tangd.socket to all interfaces on port {{ tang_port }}"
-      # The target reaches Tang over the NAT network, so bind 0.0.0.0 (not the
-      # loopback-only pin the container tiers use).  IPv4 only: the target's Tang
-      # URL is an IPv4 literal, so the role's --ipv6 auto-probe still fails and
-      # pins --ipv4 deterministically.
+      # The target reaches Tang over the NAT network, so bind 0.0.0.0. IPv4 only:
+      # the target's Tang URL is an IPv4 literal, so the role's --ipv6 auto-probe
+      # fails and pins --ipv4 deterministically.
       ansible.builtin.copy:
         dest: /etc/systemd/system/tangd.socket.d/listen.conf
         mode: '0644'
@@ -50,8 +47,8 @@
 
     - name: "Generate Tang signing keys (once)"
       # tang 15 (Debian 13) ships tangd-keygen in tang-common under /usr/libexec
-      # (off $PATH); locate it robustly.  tangd only serves keys already present
-      # in /var/db/tang, so this must succeed before /adv answers.
+      # (off $PATH); locate it robustly. tangd only serves keys already present in
+      # /var/db/tang, so this must succeed before /adv answers.
       ansible.builtin.shell:
         cmd: |
           set -eo pipefail
@@ -84,127 +81,7 @@
       delay: 1
       until: _tang_adv.status == 200
 
-# ── 2. Encrypted host: ZFS platform prep (out of the role's scope) ───────────
-- name: "Prepare the encrypted host (ZFS build chain)"
-  hosts: clevis-target
-  gather_facts: true
-  become: true
-  tasks:
-    - name: "Enable the contrib component (zfs-dkms lives there)"
-      # zfs-dkms is in `contrib`.  Drop in a dedicated source file rather than
-      # regex-editing the base list — the debian/trixie64 box uses old-style
-      # /etc/apt/sources.list (deb ... trixie main), not DEB822 debian.sources,
-      # so this stays correct regardless of the box's base format and is idempotent.
-      ansible.builtin.copy:
-        dest: /etc/apt/sources.list.d/contrib.list
-        mode: '0644'
-        content: |
-          deb https://deb.debian.org/debian trixie contrib
-          deb https://deb.debian.org/debian trixie-updates contrib
-
-    - name: "Install the DKMS build chain + matching kernel headers"
-      ansible.builtin.apt:
-        name:
-          - build-essential
-          - dkms
-          - gdisk
-          - "linux-headers-{{ ansible_facts.kernel }}"
-        state: present
-        update_cache: true
-
-    # ── Pre-flight: fail fast + legibly on kernel/zfs-dkms drift ──────────────
-    # The real Tier-2 brittleness (see clevis-testing-harness-plan.md): a
-    # debian/trixie64 kernel bump ahead of contrib's zfs-dkms — OpenZFS <= 2.4.1
-    # will not build against a 7.0+ kernel.  Surface the running kernel + the
-    # zfs-dkms/header candidates BEFORE the minutes-long DKMS compile so a drift
-    # failure reads as "kernel X vs zfs-dkms Y", not a wall of gcc errors buried
-    # in apt's postinst output.  (apt-cache policy has no module equivalent.)
-    - name: "Pre-flight | resolve zfs-dkms + kernel-headers candidates"  # noqa: command-instead-of-module
-      ansible.builtin.shell:
-        cmd: |
-          set -euo pipefail
-          # Emit "(none)" when apt-cache prints no Candidate line at all (package
-          # entirely absent — the tier2-01 "contrib not effective" case) so the
-          # assert below catches both "absent" and "no installable candidate".
-          cand() { apt-cache policy "$1" | awk '/Candidate:/{print $2; f=1} END{if(!f)print "(none)"}'; }
-          echo "kernel={{ ansible_facts.kernel }}"
-          echo "zfs-dkms=$(cand zfs-dkms)"
-          echo "headers=$(cand 'linux-headers-{{ ansible_facts.kernel }}')"
-        executable: /bin/bash
-      register: _zfs_candidates
-      changed_when: false
-      check_mode: false
-
-    - name: "Pre-flight | show resolved kernel/zfs-dkms/header versions"
-      ansible.builtin.debug:
-        var: _zfs_candidates.stdout_lines
-
-    - name: "Pre-flight | fail fast if zfs-dkms or matching headers are unavailable"
-      # Catches the tier2-01 class (contrib not effective -> no candidate) and a
-      # kernel/headers mismatch, before the compile, with an actionable message.
-      ansible.builtin.assert:
-        that:
-          - "'zfs-dkms=(none)' not in _zfs_candidates.stdout"
-          - "'headers=(none)' not in _zfs_candidates.stdout"
-        fail_msg: >-
-          ZFS DKMS prerequisites unavailable for kernel {{ ansible_facts.kernel }}.
-          Resolved: {{ _zfs_candidates.stdout | trim }}. The trixie kernel has
-          likely moved ahead of contrib's zfs-dkms (or matching headers). Pin the
-          box/kernel or bump zfs-dkms before retrying — see the OpenZFS/kernel-7.0
-          note in clevis-testing-harness-plan.md.
-        success_msg: >-
-          zfs-dkms + linux-headers-{{ ansible_facts.kernel }} both installable
-          ({{ _zfs_candidates.stdout | trim }}).
-
-    - name: "Install ZFS (DKMS build + userland), with drift diagnostics on failure"
-      # block/rescue so a DKMS *build* failure (kernel too new for this OpenZFS)
-      # surfaces the make.log tail instead of an opaque apt postinst error.
-      block:
-        - name: "Install ZFS (DKMS build + userland)"
-          ansible.builtin.apt:
-            name:
-              - zfs-dkms
-              - zfsutils-linux
-            state: present
-      rescue:
-        - name: "Collect the ZFS DKMS build log"  # noqa: command-instead-of-module
-          ansible.builtin.shell:
-            cmd: |
-              set -uo pipefail
-              echo "== dkms status =="; dkms status zfs 2>/dev/null || true
-              log=$(ls -1t /var/lib/dkms/zfs/*/build/make.log 2>/dev/null | head -n1 || true)
-              [ -n "$log" ] && { echo "== tail $log =="; tail -n 40 "$log"; }
-            executable: /bin/bash
-          register: _zfs_dkms_log
-          changed_when: false
-
-        - name: "Fail with ZFS DKMS build diagnostics"
-          ansible.builtin.fail:
-            msg: >-
-              zfs-dkms failed to build/install on kernel {{ ansible_facts.kernel }}.
-              Candidates were: {{ _zfs_candidates.stdout | trim }}.
-              DKMS diagnostics:
-              {{ _zfs_dkms_log.stdout | default('(none captured)') }}
-
-    - name: "Load the ZFS kernel module"
-      community.general.modprobe:
-        name: zfs
-        state: present
-
-    - name: "Verify the ZFS module loaded and userland is present"  # noqa: command-instead-of-module
-      # Proves the DKMS module actually built + loaded and matches userland —
-      # `modprobe` alone can succeed against a stale module; `zfs version` fails
-      # loudly if kmod/userland drifted.  No module equivalent.
-      ansible.builtin.command: zfs version
-      register: _zfs_version
-      changed_when: false
-      check_mode: false
-
-    - name: "Show the built ZFS version"
-      ansible.builtin.debug:
-        var: _zfs_version.stdout_lines
-
-# ── 3. Controller: vault password + fresh recovery-key gate ──────────────────
+# ── 2. Controller: vault password + fresh recovery-key gate ──────────────────
 - name: "Prepare the controller (vault pass + recovery-key gate)"
   hosts: clevis-target
   gather_facts: false

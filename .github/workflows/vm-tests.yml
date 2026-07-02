@@ -92,6 +92,11 @@ jobs:
             molecule 'molecule-plugins[vagrant]' python-vagrant ansible
           ansible-galaxy collection install ansible.posix community.general
 
+      - name: Install the encrypted_storage_pool consumer (for the vm scenario)
+        # The vm Tier-2 composes encrypted_storage_pool (btrfs) as the downstream
+        # consumer. Harmless for the default scenario (which doesn't use it).
+        run: ansible-galaxy role install -r molecule/vm/requirements.yml -p molecule/vm/roles
+
       - name: "molecule test -s ${{ matrix.scenario }}"
         env:
           LIBVIRT_DEFAULT_URI: qemu:///system

@@ -50,6 +50,14 @@ jobs:
           ansible-galaxy collection install -r requirements.yml
           ansible-galaxy collection install community.general
 
+      - name: Stub encrypted_storage_pool for lint
+        # The vm scenario's converge composes encrypted_storage_pool (installed for
+        # real by vm-tests). A stub lets ansible-lint resolve the role reference
+        # without a network clone; the scenario roles dir is excluded from linting.
+        run: |
+          mkdir -p molecule/vm/roles/encrypted_storage_pool/tasks
+          printf -- '---\n' > molecule/vm/roles/encrypted_storage_pool/tasks/main.yml
+
       - name: yamllint
         run: yamllint .
 
