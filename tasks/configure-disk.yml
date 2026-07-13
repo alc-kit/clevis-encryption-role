@@ -113,8 +113,23 @@
     cmd: |
       set -uo pipefail
       NAME="crypt-{{ disk_device }}"
-      DEV="/dev/{{ disk_device }}"
+      # Recover the Clevis passphrase from the disk that ACTUALLY backs this
+      # mapper — NOT from /dev/{{ disk_device }}.  NVMe kernel names (nvmeXn1)
+      # are assigned by controller probe order and are not stable across boots,
+      # so the running mapper crypt-<name> can sit on a different /dev/nvmeXn1
+      # than its name implies.  'cryptsetup status' reports the true backing
+      # device; using the assumed path fed the wrong disk's key into cryptsetup
+      # refresh and failed with "No key available with this passphrase" (rc -2)
+      # whenever the names were crossed.  (crypttab is keyed by UUID and ZFS by
+      # its own labels, so the crossing is harmless to the pool — only this
+      # name→device assumption broke.)
+      DEV=$(cryptsetup status "$NAME" 2>/dev/null | awk '/^[[:space:]]*device:/{print $2; exit}')
       applied=""
+
+      if [ -z "$DEV" ]; then
+        echo "could not resolve backing device for $NAME" >&2
+        exit 1
+      fi
 
       slot=$(clevis luks list -d "$DEV" 2>/dev/null | head -1 | cut -d: -f1 | tr -d ' ')
       if [ -n "$slot" ]; then
