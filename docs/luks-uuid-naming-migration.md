@@ -61,10 +61,11 @@ Hand-off: format the by-id device → read its LUKS UUID → thereafter referenc
 Why this matters beyond the rename: `luks-<uuid>` works identically whether the backing device is a local NVMe or a `/dev/mapper/mpathX`, and a by-id hardware id exists for every device class. Getting this model right **now** (local-only) is what makes the multipath/FC/iSCSI extension (§8) additive rather than a rewrite.
 
 ### 2.3 Discovery (local now; multipath-aware later)
-Auto-discovery stays a **local-disk convenience**. Two changes make it correct and safe on the way to multipath:
+Auto-discovery stays a **local-disk convenience**. Three changes make it correct and safe on the way to multipath:
 
-1. **Emit stable by-id paths, not bare kernel names.** The data is already in `ansible_devices.<dev>.links.ids`; pick a stable id per disk (prefer `nvme-eui`/`wwn-`, fall back to `ata-…-<serial>`).
-2. **Refuse, don't mis-handle, multipath — loudly.** A path device is detectable by a non-empty `ansible_devices.<dev>.holders` pointing at a dm-mpath device (and `links.ids` containing `dm-uuid-mpath-…`). Until multipath is first-class, discovery must **exclude such paths and fail with a clear message** ("multipath device detected; set clevis_raw_disks explicitly by /dev/disk/by-id") rather than treating the N paths as N disks. (The UUID-collision guard is the backstop if this is bypassed — N paths → one LUKS UUID → it aborts.)
+0. **Read facts via `ansible_facts["devices"]`, not the top-level `ansible_devices`.** Ansible is phasing out injected `ansible_*` fact vars (`inject_facts_as_vars` heading to `false`); `ansible_facts["devices"]` is the durable form. The current discovery `set_fact` (`tasks/main.yml:102`) uses `ansible_devices` and must switch as part of this rework (see §3.1).
+1. **Emit stable by-id paths, not bare kernel names.** The data is already in `ansible_facts["devices"][<dev>].links.ids`; pick a stable id per disk (prefer `nvme-eui`/`wwn-`, fall back to `ata-…-<serial>`).
+2. **Refuse, don't mis-handle, multipath — loudly.** A path device is detectable by a non-empty `ansible_facts["devices"][<dev>].holders` pointing at a dm-mpath device (and `links.ids` containing `dm-uuid-mpath-…`). Until multipath is first-class, discovery must **exclude such paths and fail with a clear message** ("multipath device detected; set clevis_raw_disks explicitly by /dev/disk/by-id") rather than treating the N paths as N disks. (The UUID-collision guard is the backstop if this is bypassed — N paths → one LUKS UUID → it aborts.)
 
 For SAN/multipath and any host with asynchronous device appearance, **explicit device lists (by stable id) are the supported path** — size-group auto-discovery is inherently unreliable when devices arrive late or a LUN is reachable by several nodes. The role already accepts a pre-set `clevis_raw_disks`; the change is that its entries become by-id paths.
 
@@ -85,6 +86,7 @@ For SAN/multipath and any host with asynchronous device appearance, **explicit d
 | `tasks/replace-disk.yml:48` | match | remove the **dead** disk's crypttab line. **Hazard:** can't rebuild the name from a bare node and can't `blkid` a removed disk. → match by operator-supplied old UUID, or prune orphan (§4.4). |
 | `tasks/replace-disk.yml:56-60` | parse | re-derive the disk set from `/dev/mapper/crypt-*` by stripping. → grep `^luks-`; stop treating the suffix as a device node (§4.1). |
 | `tasks/rotate-passphrase.yml:18-22` + `:64,73-74,86,97,111,121,130` | parse+construct | **deepest coupling:** strips `crypt-` to a bare node then uses it as `/dev/<node>` for luksAddKey/RemoveKey/clevis regen. → resolve each `luks-*` mapper to its backing device (or use `/dev/disk/by-uuid/<uuid>`) (§4.1). |
+| `tasks/main.yml:98-102` | parse | discovery `set_fact` — rework to emit stable by-id paths + refuse multipath (§2.3), **and switch `ansible_devices` → `ansible_facts["devices"]`** (top-level fact injection is being removed). |
 | `tasks/main.yml:104` | — | reject regex already lists **both** `luks-` and `crypt` → **no change** (open mappers stay filtered under either scheme). |
 | `tasks/boot-ordering-dropins.yml`, `handlers/main.yml`, `tasks/verify-crypttab.yml`, `tasks/assert-crypttab-unique.yml`, `files/crypttab-uuid-audit.sh` | — | **no change** (already name-agnostic; the audit parses crypttab by field, `assert` operates on `clevis_crypttab_pairs`). |
 
