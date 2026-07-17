@@ -1,0 +1,9 @@
+{
+  "_comment": "Mixed-size host: small OS SSD + two large data NVMe. The numeric size_bytes sort must pick the 2T NVMe, not lexicographically-greater '4...' (223G). Regression for the sectors-as-string bug.",
+  "clevis_discovery_devices": {
+    "nvme0n1": {"removable": "0", "size": "1.82 TiB", "sectors": "3907029168", "host_sectorsize": "512"},
+    "nvme1n1": {"removable": "0", "size": "1.82 TiB", "sectors": "3907029168", "host_sectorsize": "512"},
+    "sda":     {"removable": "0", "size": "223.57 GiB", "sectors": "468862128", "host_sectorsize": "512"}
+  },
+  "expected_disks": ["nvme0n1", "nvme1n1"]
+}

@@ -1,0 +1,11 @@
+{
+  "_comment": "Only sdb is a real data disk. dm-0 is the SAME size but must be excluded by the dm- prefix (so it does not join sdb's group); loop0/zram0 rejected by prefix; sr0 rejected as removable.",
+  "clevis_discovery_devices": {
+    "sdb":   {"removable": "0", "size": "3.64 TiB", "sectors": "7814037168", "host_sectorsize": "512"},
+    "dm-0":  {"removable": "0", "size": "3.64 TiB", "sectors": "7814037168", "host_sectorsize": "512"},
+    "loop0": {"removable": "0", "size": "50 MiB", "sectors": "102400", "host_sectorsize": "512"},
+    "zram0": {"removable": "0", "size": "8 GiB", "sectors": "16777216", "host_sectorsize": "512"},
+    "sr0":   {"removable": "1", "size": "1024 MiB", "sectors": "2097152", "host_sectorsize": "512"}
+  },
+  "expected_disks": ["sdb"]
+}

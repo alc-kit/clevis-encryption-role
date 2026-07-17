@@ -1,0 +1,63 @@
+---
+# Auto-discovery of the encrypted-data disks — a LOCAL-DISK CONVENIENCE only.
+#
+# Included from main.yml solely when the caller did NOT supply clevis_raw_disks
+# (see the include guard there). An explicit, inventory-declared device list is
+# always preferred, and is REQUIRED for multipath / FC / iSCSI / SAN — see
+# docs/luks-uuid-naming-migration.md §2.3/§8.
+#
+# SCOPE NOTE: choosing WHICH physical devices to encrypt is a storage-topology /
+# inventory decision and is arguably outside this NBDE role's remit (the role's
+# job is to encrypt the devices it is given, not to guess them — and guessing
+# wrong means LUKS-formatting the wrong disk). This heuristic is retained as a
+# convenience for homogeneous local-disk nodes and is a candidate for
+# deprecation / relocation to the caller. It is isolated in this file precisely
+# so that move is a one-line change in main.yml.
+#
+# Selection: filter out removable / virtual / already-mapped devices, group the
+# rest by size, and take the largest group by BYTE size.
+#
+# Rejection prefixes:
+#   loop  — loopback file mounts
+#   sr    — optical drives
+#   dm-   — device-mapper synthetic devices
+#   nbd   — network block devices
+#   md    — Linux software RAID
+#   luks- — LUKS mappers (post-open)
+#   crypt — dm-crypt mappers (post-open)
+#   zd    — ZFS zvols (block devices backing guest VMs).  Without this filter, a
+#           single zvol larger than the physical drives wins the "largest size
+#           group" selection and the role iterates the zvol instead of the data
+#           disks — leaving the real crypttab entries untouched.
+#   zram  — compressed RAM block devices
+#   rbd   — Ceph RADOS block devices
+#
+# Device source: clevis_discovery_devices, defaulting to ansible_facts['devices']
+# (NOT the injected top-level ansible_devices, which disappears once
+# inject_facts_as_vars is disabled). Overridable so the selection logic is
+# unit-testable device-free — see tests/discovery/.
+
+- name: "Select the largest same-size group of eligible local disks"
+  ansible.builtin.set_fact:
+    clevis_raw_disks: "{{ (query_logic | from_json | last).disks }}"
+  vars:
+    # Sort the groups ascending by the INTEGER size_bytes so the consumer's
+    # `| last` picks the largest. The sort MUST be numeric, not on the raw
+    # `sectors` string: sectors is a string fact, and a lexicographic sort ranks
+    # e.g. '468862128' (223G) above '3907029168' (2T) because '4' > '3' — which
+    # would mis-select a small OS disk over the large data NVMe on a mixed-size
+    # host.
+    query_logic: >-
+      {% set results = [] %}
+      {% set filtered = (clevis_discovery_devices | default(ansible_facts['devices'])) | dict2items
+         | selectattr('value.removable', 'equalto', '0')
+         | rejectattr('key', 'match', '^(loop|sr|dm-|nbd|md|luks-|crypt|zd|zram|rbd)') | list %}
+      {% for size, items in filtered | groupby('value.size') %}
+        {% set total = (items[0].value.sectors | int) * (items[0].value.host_sectorsize | default(512) | int) %}
+        {% set _ = results.append({
+            'size': size, 'size_bytes': total | int,
+            'disks': items | map(attribute='key') | list | sort
+        }) %}
+      {% endfor %}
+      {{ results | sort(attribute='size_bytes') | to_json }}
+  check_mode: false

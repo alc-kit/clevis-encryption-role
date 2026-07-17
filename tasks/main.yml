@@ -68,57 +68,20 @@
       become: false
       check_mode: false
 
+    # Auto-discovery is a LOCAL-DISK CONVENIENCE only, and is isolated in
+    # discover-disks.yml so it is easy to deprecate/relocate (choosing which
+    # devices to encrypt is a storage-topology/inventory concern — see that file
+    # and docs/luks-uuid-naming-migration.md).
+    #   when: not defined — an explicit, inventory-declared clevis_raw_disks is
+    #     always preferred (and required for multipath/SAN); discovery only fills
+    #     the gap when the caller supplied nothing. Molecule/test harnesses that
+    #     pre-set clevis_raw_disks therefore skip discovery entirely.
+    #   tags: always — the disk list is consumed by both the provisioning and
+    #     systemd blocks; without it the --tags systemd path has no disk list.
     - name: "Discover raw physical data disks (largest size group)"
-      # Filters out removable, virtual, and already-mapped devices, then groups
-      # by size and selects the largest group — the data disks.
-      # tags: always — this fact is consumed by both the provisioning and
-      # systemd blocks; without it the --tags systemd path has no disk list.
-      # when: not defined — allows Molecule (and other test harnesses) to
-      # pre-set clevis_raw_disks via vars without triggering the ansible_facts
-      # devices inspection, which cannot work reliably in a container environment.
-      # Reads ansible_facts['devices'] (not the injected top-level ansible_devices,
-      # which disappears once inject_facts_as_vars is disabled).
-      #
-      # Rejection prefixes:
-      #   loop  — loopback file mounts
-      #   sr    — optical drives
-      #   dm-   — device-mapper synthetic devices
-      #   nbd   — network block devices
-      #   md    — Linux software RAID
-      #   luks- — LUKS mappers (post-open)
-      #   crypt — dm-crypt mappers (post-open)
-      #   zd    — ZFS zvols (block devices backing guest VMs).  Without this
-      #           filter, a single zvol that happens to be larger than the
-      #           physical NVMe drives wins the "largest size group" selection
-      #           and the role silently iterates over the zvol instead of the
-      #           data disks — leaving the real crypttab entries untouched.
-      #   zram  — compressed RAM block devices
-      #   rbd   — Ceph RADOS block devices
-      tags: always
+      ansible.builtin.include_tasks: discover-disks.yml
       when: clevis_raw_disks is not defined
-      ansible.builtin.set_fact:
-        clevis_raw_disks: "{{ (query_logic | from_json | last).disks }}"
-      vars:
-        # Groups the candidate disks by size and returns them sorted ascending by
-        # byte size, so the consumer's `| last` selects the largest group. The sort
-        # MUST be on the integer size_bytes, not the raw `sectors` string: sectors
-        # is a string fact, and a lexicographic sort ranks e.g. '468862128' (223G)
-        # above '3907029168' (2T) because '4' > '3' — which would mis-select a
-        # small OS disk over the large data NVMe on a mixed-size host.
-        query_logic: >-
-          {% set results = [] %}
-          {% set filtered = ansible_facts['devices'] | dict2items
-             | selectattr('value.removable', 'equalto', '0')
-             | rejectattr('key', 'match', '^(loop|sr|dm-|nbd|md|luks-|crypt|zd|zram|rbd)') | list %}
-          {% for size, items in filtered | groupby('value.size') %}
-            {% set total = (items[0].value.sectors | int) * (items[0].value.host_sectorsize | default(512) | int) %}
-            {% set _ = results.append({
-                'size': size, 'size_bytes': total | int,
-                'disks': items | map(attribute='key') | list | sort
-            }) %}
-          {% endfor %}
-          {{ results | sort(attribute='size_bytes') | to_json }}
-      check_mode: false
+      tags: always
 
     # ── BLOCK: PROVISIONING ─────────────────────────────────────────────────
     # Skipped entirely when the recovery key vault file already exists on the

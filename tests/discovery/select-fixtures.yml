@@ -1,0 +1,22 @@
+---
+# Device-free harness that runs the role's REAL discovery task
+# (tasks/discover-disks.yml) against an injected synthetic device map and
+# asserts the selected disk list. run.sh invokes this once per fixture with
+# `-e @fixtures/<case>.json`, each supplying `clevis_discovery_devices` (the
+# synthetic ansible_facts['devices'] stand-in) and the `expected_disks` result.
+# No block devices, no root, no gathered facts — pure selection logic.
+
+- name: "Disk-discovery selection — fixture harness"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Run the role's discovery task against the injected device map"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../tasks/discover-disks.yml"
+
+    - name: "Assert discovery selected the expected disks"
+      ansible.builtin.assert:
+        that:
+          - "clevis_raw_disks == expected_disks"
+        fail_msg: "discovery selected {{ clevis_raw_disks }} (expected {{ expected_disks }})"
+        success_msg: "correct: selected {{ clevis_raw_disks }}"
+        quiet: true

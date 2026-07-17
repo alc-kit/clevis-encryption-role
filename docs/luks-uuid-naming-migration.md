@@ -69,6 +69,22 @@ Auto-discovery stays a **local-disk convenience**. Three changes make it correct
 
 For SAN/multipath and any host with asynchronous device appearance, **explicit device lists (by stable id) are the supported path** — size-group auto-discovery is inherently unreliable when devices arrive late or a LUN is reachable by several nodes. The role already accepts a pre-set `clevis_raw_disks`; the change is that its entries become by-id paths.
 
+### 2.4 Should device selection live in this role at all? (recommendation: no)
+
+**Position: deprecate in-role auto-discovery; make an explicit device list the role's contract.** Choosing *which* physical devices become encrypted storage is a storage-topology / inventory decision — policy — whereas this role is the encryption *mechanism* ("encrypt the devices I'm given, bind Clevis, publish the unlock seam"). Reasons the heuristic doesn't belong here:
+
+- **It's a destructive guess.** The role `luksFormat`s whatever it selects; a wrong guess destroys the wrong disk. A "largest size group" heuristic cannot be made correct in general (it already mis-handles multipath, mixed-size intentional layouts, large OS disks, SANs) — and for a destructive op, explicit beats implicit.
+- **It's a second, divergent source of truth.** The consumers (`proxmox_encrypted_storage`, `encrypted-storage-pool`) own the pool topology and already derive their members from the crypttab this role writes. Selection should flow **one direction**: inventory declares the devices → this role encrypts them + writes crypttab → consumers read crypttab. An independent heuristic here can disagree with what the operator/consumer intends.
+- **It's the untested, bug-prone corner.** Molecule pre-sets `clevis_raw_disks`, so discovery had zero coverage — which is exactly how the lexicographic-sort mis-selection survived. Removing it shrinks the role's risk surface.
+
+**Target contract:** `clevis_raw_disks` is a required input (a list of stable `/dev/disk/by-id/...` identifiers), declared in inventory / host_vars by the caller (the "upstream users"). The role fails fast with a clear message if it is absent.
+
+**Transition (enabled by the extraction in this PR):** the heuristic now lives isolated in `tasks/discover-disks.yml` behind the `when: clevis_raw_disks is not defined` include guard, so it can be staged out without touching the rest of the role:
+1. *Now:* keep it as a clearly-labelled, opt-in, local-only convenience; emit a deprecation `warn` when it runs; refuse multipath loudly (§2.3).
+2. *Later:* flip to required — remove the fallback (or gate it behind an explicit `clevis_allow_disk_autodiscovery: true`), so the default path is always an explicit inventory list.
+
+This is a small, low-risk change precisely because the extraction already isolated it; it does not block the `luks-<uuid>` work and can land on its own.
+
 ---
 
 ## 3. Change inventory (from a full three-repo sweep)
