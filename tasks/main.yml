@@ -74,8 +74,10 @@
       # tags: always — this fact is consumed by both the provisioning and
       # systemd blocks; without it the --tags systemd path has no disk list.
       # when: not defined — allows Molecule (and other test harnesses) to
-      # pre-set clevis_raw_disks via vars without triggering ansible_devices
-      # inspection, which cannot work reliably in a container environment.
+      # pre-set clevis_raw_disks via vars without triggering the ansible_facts
+      # devices inspection, which cannot work reliably in a container environment.
+      # Reads ansible_facts['devices'] (not the injected top-level ansible_devices,
+      # which disappears once inject_facts_as_vars is disabled).
       #
       # Rejection prefixes:
       #   loop  — loopback file mounts
@@ -97,19 +99,25 @@
       ansible.builtin.set_fact:
         clevis_raw_disks: "{{ (query_logic | from_json | last).disks }}"
       vars:
+        # Groups the candidate disks by size and returns them sorted ascending by
+        # byte size, so the consumer's `| last` selects the largest group. The sort
+        # MUST be on the integer size_bytes, not the raw `sectors` string: sectors
+        # is a string fact, and a lexicographic sort ranks e.g. '468862128' (223G)
+        # above '3907029168' (2T) because '4' > '3' — which would mis-select a
+        # small OS disk over the large data NVMe on a mixed-size host.
         query_logic: >-
           {% set results = [] %}
-          {% set filtered = ansible_devices | dict2items
+          {% set filtered = ansible_facts['devices'] | dict2items
              | selectattr('value.removable', 'equalto', '0')
              | rejectattr('key', 'match', '^(loop|sr|dm-|nbd|md|luks-|crypt|zd|zram|rbd)') | list %}
-          {% for size, items in filtered | groupby('value.size') | sort(attribute='1.0.value.sectors') %}
+          {% for size, items in filtered | groupby('value.size') %}
             {% set total = (items[0].value.sectors | int) * (items[0].value.host_sectorsize | default(512) | int) %}
             {% set _ = results.append({
                 'size': size, 'size_bytes': total | int,
                 'disks': items | map(attribute='key') | list | sort
             }) %}
           {% endfor %}
-          {{ results | to_json }}
+          {{ results | sort(attribute='size_bytes') | to_json }}
       check_mode: false
 
     # ── BLOCK: PROVISIONING ─────────────────────────────────────────────────
