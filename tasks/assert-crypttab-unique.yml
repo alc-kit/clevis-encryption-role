@@ -1,0 +1,45 @@
+---
+# Pure pre-flight assertions over `clevis_crypttab_pairs` — the list of
+# (target, dev, uuid, type) tuples the role is about to render into
+# /etc/crypttab.  Split out from the blkid collection (validate-crypttab.yml) so
+# CI can exercise exactly this logic device-free by injecting fixtures for
+# `clevis_crypttab_pairs` (see tests/crypttab-guard/).
+#
+# Guards the LUKS UUID-collision failure mode: two crypt-<dev> targets bound to
+# the same UUID both resolve one /dev/disk/by-uuid device at boot, one mapper
+# wins and the other silently fails under nofail — leaving e.g. a ZFS mirror
+# member UNAVAIL every boot.  UUID truth is derived from live blkid at apply
+# time (never from cached host_vars or device-node guessing — see the
+# mitigation doc's Non-goals), so a bad set fails the play instead of persisting.
+
+- name: "Pre-flight: every data disk is present and LUKS-formatted"
+  ansible.builtin.assert:
+    that:
+      - item.uuid | default('') | length > 0
+      - item.type | default('') == 'crypto_LUKS'
+    fail_msg: >-
+      {{ item.dev }} (target {{ item.name }}) is missing or not a LUKS2 volume
+      (uuid='{{ item.uuid | default('') }}', type='{{ item.type | default('') }}').
+      Refusing to write a crypttab entry with an unresolved UUID.
+    success_msg: "{{ item.name }} -> {{ item.dev }} UUID={{ item.uuid }} (crypto_LUKS)"
+    quiet: true
+  loop: "{{ clevis_crypttab_pairs }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: "Pre-flight: no LUKS UUID is shared across two crypttab targets"
+  ansible.builtin.assert:
+    that:
+      - (clevis_crypttab_pairs | map(attribute='uuid') | list | unique | length)
+        == (clevis_crypttab_pairs | length)
+    fail_msg: >-
+      Duplicate LUKS UUID across crypttab targets — this is the mirror-member
+      UNAVAIL bug: two targets would resolve the same device at boot and one
+      mapper would silently fail. Target -> UUID set about to be written:
+      {{ clevis_crypttab_pairs
+         | map(attribute='name') | list
+         | zip(clevis_crypttab_pairs | map(attribute='uuid') | list)
+         | list }}
+    success_msg: >-
+      All {{ clevis_crypttab_pairs | length }} crypttab UUIDs are unique.
+    quiet: true

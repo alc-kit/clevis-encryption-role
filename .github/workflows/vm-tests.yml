@@ -46,7 +46,7 @@ jobs:
           - scenario: default   # Tier-1: LUKS keyslot on a real virtio disk
           - scenario: vm        # Tier-2: boot ordering, 2 VMs, ZFS-on-LUKS, reboot
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Enable unprivileged access to /dev/kvm
         run: |

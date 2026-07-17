@@ -1,0 +1,7 @@
+{
+  "clevis_crypttab_pairs": [
+    {"name": "crypt-nvme6n1", "dev": "/dev/nvme6n1", "uuid": "7413df54-dd88-4b52-8bf8-c3ca15638dbc", "type": "crypto_LUKS"},
+    {"name": "crypt-nvme7n1", "dev": "/dev/nvme7n1", "uuid": "7413df54-dd88-4b52-8bf8-c3ca15638dbc", "type": "crypto_LUKS"},
+    {"name": "crypt-nvme5n1", "dev": "/dev/nvme5n1", "uuid": "50ca1601-5785-4ac0-b262-8cae7b29e011", "type": "crypto_LUKS"}
+  ]
+}

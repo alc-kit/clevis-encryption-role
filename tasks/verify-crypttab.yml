@@ -1,0 +1,36 @@
+---
+# Post-deploy verification (mitigation doc item 2), reusing the fleet-wide audit
+# tool (item 3).  Installs crypttab-uuid-audit.sh persistently so operators can
+# re-run it ad hoc / from cron / fleet-wide, and runs it against the freshly
+# written /etc/crypttab.  It cross-references every UUID with the live block
+# devices and — for any mapper already open — the mapper's true backing device,
+# catching the failure mode directly regardless of how a bad entry arose (a
+# stale entry the per-disk pre-flight can't see is caught here as an orphan).
+#
+# Runs at the end of the boot-ordering block, after crypttab is on disk.  These
+# data disks are noauto (opened by clevis-unlock-data at boot, not by
+# systemd-cryptsetup), so mapper presence is NOT asserted here — that would
+# false-fail on a first provision before the disks are opened.  The audit's
+# hard checks (duplicate / orphan / crossed live mapper) are what matter and do
+# not depend on every mapper being open.
+
+- name: "Install crypttab UUID audit script"
+  ansible.builtin.copy:
+    src: crypttab-uuid-audit.sh
+    dest: /usr/local/sbin/crypttab-uuid-audit.sh
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: "Audit /etc/crypttab for UUID collisions against live devices"
+  # Exit codes: 0 clean, 2 hard finding (duplicate / stale / crossed mapper),
+  # 3 soft only (a crypto_LUKS device with no crypttab entry — not fatal, e.g. a
+  # disk mid-replacement). Fail the play only on a hard finding.
+  ansible.builtin.command: /usr/local/sbin/crypttab-uuid-audit.sh
+  register: _crypttab_audit
+  changed_when: false
+  failed_when: _crypttab_audit.rc not in [0, 3]
+
+- name: "Show crypttab audit result"
+  ansible.builtin.debug:
+    var: _crypttab_audit.stdout_lines

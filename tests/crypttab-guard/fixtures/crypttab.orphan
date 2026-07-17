@@ -1,0 +1,3 @@
+# A stale entry: crypt-nvme5n1's UUID is not present on any device. -> exit 2 (HARD).
+crypt-nvme5n1 UUID=deadbeef-0000-0000-0000-000000000000 none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target
+crypt-nvme6n1 UUID=7413df54-dd88-4b52-8bf8-c3ca15638dbc none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target

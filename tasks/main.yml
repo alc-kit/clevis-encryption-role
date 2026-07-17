@@ -187,6 +187,13 @@
         # provisioned node should combine with prestage if they also want the
         # IP-family pin re-evaluated:  --tags prestage,systemd
 
+        # Pre-flight guard: collect the (target, uuid) set from live blkid and
+        # fail the play on a duplicate/unresolved LUKS UUID BEFORE any crypttab
+        # line is written — the crypttab UUID-collision bug that leaves a mirror
+        # member UNAVAIL every boot.
+        - name: "Validate the crypttab UUID set before writing it"
+          ansible.builtin.include_tasks: validate-crypttab.yml
+
         - name: "Configure crypttab and live discard for each data disk"
           ansible.builtin.include_tasks: configure-disk.yml
           loop: "{{ clevis_raw_disks }}"
@@ -200,3 +207,10 @@
         # set changes (the unlock service's timeout scales with the disk count).
         - name: "Write disk-set systemd boot-ordering drop-ins"
           ansible.builtin.include_tasks: boot-ordering-dropins.yml
+
+        # Post-deploy verification: install the fleet-wide audit tool and run it
+        # against the freshly written /etc/crypttab, cross-referencing live
+        # devices (and any open mapper's true backing device). Fails on a hard
+        # finding (duplicate / orphan / crossed mapper).
+        - name: "Verify crypttab has no UUID collisions"
+          ansible.builtin.include_tasks: verify-crypttab.yml

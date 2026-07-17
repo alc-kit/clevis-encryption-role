@@ -1,0 +1,13 @@
+---
+# Device-free harness that loads the role's pure crypttab assertions
+# (tasks/assert-crypttab-unique.yml) against an injected `clevis_crypttab_pairs`
+# fixture passed with `-e @fixtures/pairs-*.json`.  run.sh invokes this once per
+# fixture and checks the play's exit status: unique/valid fixtures must pass,
+# duplicate/unformatted fixtures must fail.  No block devices, no root.
+
+- name: "Crypttab uniqueness assertions — fixture harness"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Run the role's pure crypttab assertions on the injected fixture"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../tasks/assert-crypttab-unique.yml"

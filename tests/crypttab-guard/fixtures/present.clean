@@ -1,0 +1,5 @@
+# LUKS UUIDs "present on the host" for the offline (--devmap) audit tests.
+# One UUID per line; blank lines and '#' comments ignored.
+aaaa1111-2222-3333-4444-555555555555
+7413df54-dd88-4b52-8bf8-c3ca15638dbc
+50ca1601-5785-4ac0-b262-8cae7b29e011

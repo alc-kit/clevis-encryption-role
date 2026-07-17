@@ -72,6 +72,13 @@
       # disk count) + the clevis-luks-unlocked.target seam for the new disk set.
       ansible.builtin.include_tasks: boot-ordering-dropins.yml
 
+    - name: "Replace disk | verify crypttab has no UUID collisions"
+      # A replacement rewrites two crypttab lines (add new, drop old) — the exact
+      # moment a duplicate/stale LUKS UUID can slip in. Audit the resulting file
+      # against the live devices before finishing, so a bad replacement fails
+      # here rather than surfacing as an UNAVAIL mapper on the next reboot.
+      ansible.builtin.include_tasks: verify-crypttab.yml
+
   always:
     - name: "Replace disk | remove temporary key from the host"
       ansible.builtin.file:

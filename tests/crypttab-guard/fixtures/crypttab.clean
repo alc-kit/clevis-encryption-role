@@ -1,0 +1,4 @@
+# Correct crypttab: three unique UUIDs, each present on the host. -> exit 0
+crypt-nvme5n1 UUID=aaaa1111-2222-3333-4444-555555555555 none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target
+crypt-nvme6n1 UUID=7413df54-dd88-4b52-8bf8-c3ca15638dbc none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target
+crypt-nvme7n1 UUID=50ca1601-5785-4ac0-b262-8cae7b29e011 none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target

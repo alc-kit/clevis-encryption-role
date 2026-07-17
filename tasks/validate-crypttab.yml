@@ -1,0 +1,53 @@
+---
+# Pre-flight guard (mitigation doc item 1): collect the (target, uuid, type)
+# set the role is about to write to /etc/crypttab from LIVE blkid — one read per
+# device at apply time — then hand it to the pure assertions in
+# assert-crypttab-unique.yml.  Runs in the boot-ordering block BEFORE the
+# configure-disk loop, so a duplicate/unresolved UUID fails the play instead of
+# being persisted into crypttab (and baked into the initrd).
+#
+# Deliberately decoupled from configure-disk.yml (which re-reads blkid per disk
+# when it renders each line): both derive from the same live blkid, and the
+# post-deploy audit (verify-crypttab.yml) re-checks the final on-disk file, so
+# the exact written state is guarded end to end without refactoring the writer.
+#
+# Truth comes from the device's own LUKS header via blkid, matched to the
+# crypt-<dev> target name — NOT from cached host_vars and NOT by re-deriving the
+# device from enumeration order (see the mitigation doc's Non-goals).
+
+- name: "Pre-flight: read live LUKS UUID + type for each data disk"
+  # -o export prints KEY=VALUE lines (UUID=..., TYPE=...); parsed below. rc is
+  # non-zero for an unformatted/absent device — tolerated here so the assert
+  # (not this probe) produces the actionable failure message.
+  ansible.builtin.command: "blkid -o export /dev/{{ item }}"
+  register: _clevis_blkid
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  loop: "{{ clevis_raw_disks }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: "Pre-flight: reset the crypttab pair accumulator"
+  ansible.builtin.set_fact:
+    clevis_crypttab_pairs: []
+
+- name: "Pre-flight: build the (target, uuid, type) set to be written"
+  ansible.builtin.set_fact:
+    clevis_crypttab_pairs: >-
+      {{ clevis_crypttab_pairs + [{
+           'name': 'crypt-' ~ item.item,
+           'dev': '/dev/' ~ item.item,
+           'uuid': (item.stdout_lines | default([])
+                    | select('match', '^UUID=') | map('regex_replace', '^UUID=', '')
+                    | first | default('')),
+           'type': (item.stdout_lines | default([])
+                    | select('match', '^TYPE=') | map('regex_replace', '^TYPE=', '')
+                    | first | default(''))
+         }] }}
+  loop: "{{ _clevis_blkid.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: "Pre-flight: assert the crypttab UUID set is valid and unique"
+  ansible.builtin.include_tasks: assert-crypttab-unique.yml

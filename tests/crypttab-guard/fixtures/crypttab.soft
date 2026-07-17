@@ -1,0 +1,4 @@
+# Internally consistent (unique, all present) but leaves one present crypto_LUKS
+# device (50ca1601...) with no crypttab entry. -> exit 3 (SOFT only).
+crypt-nvme5n1 UUID=aaaa1111-2222-3333-4444-555555555555 none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target
+crypt-nvme6n1 UUID=7413df54-dd88-4b52-8bf8-c3ca15638dbc none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target

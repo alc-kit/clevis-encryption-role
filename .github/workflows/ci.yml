@@ -5,6 +5,8 @@
 #   - validate         : YAML lint + ansible-lint (production profile)
 #   - ansible-versions : syntax-check the role across supported ansible-core
 #   - network          : Tier-0 crypto/network Molecule scenario (Docker driver)
+#   - crypttab-guard   : device-free regression test for the crypttab UUID-
+#                        collision guard (audit script + pre-flight assertions)
 #
 # The heavier libvirt/KVM VM tiers (Tier-1 keyslot, Tier-2 boot ordering) live in
 # vm-tests.yml, which needs a KVM-capable runner.
@@ -32,7 +34,7 @@ jobs:
     name: validate (yamllint + ansible-lint)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -72,7 +74,7 @@ jobs:
       matrix:
         ansible: ["2.16.*", "2.17.*", "2.18.*"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -95,7 +97,7 @@ jobs:
     name: Tier-0 crypto (molecule network, Docker)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -109,3 +111,25 @@ jobs:
 
       - name: molecule test -s network
         run: molecule test -s network
+
+  crypttab-guard:
+    name: Tier-0 crypttab UUID guard (device-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install ansible-core (for the pre-flight assertion fixtures)
+        run: python -m pip install --upgrade ansible-core
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: shellcheck the audit script and test harness
+        run: shellcheck files/crypttab-uuid-audit.sh tests/crypttab-guard/run.sh
+
+      - name: Run the crypttab UUID-collision regression tests
+        run: tests/crypttab-guard/run.sh
