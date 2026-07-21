@@ -1,194 +1,166 @@
-# Migration & design plan: device identity + `luks-<UUID>` mapper naming (local now, multipath-ready)
+# Migration & design plan: persistent `crypt-<LUKS-UUID>` mapper naming (local now, multipath-ready)
 
-**Status:** proposal, for review. No code written yet.
-**Scope now:** local HDD/SSD/NVMe. **Designed for** (not built now): true multipath / FC / iSCSI, i.e. asynchronous device appearance and random device ordering — see §8.
-**Repos in scope:** `clevis-encryption-role` (owns the naming/discovery), `proxmox-install/…/proxmox_encrypted_storage` (ZFS consumer), `encrypted-storage-pool` (btrfs/LVM consumer).
-**Related:** the crypttab UUID-collision guard already shipped in `clevis-encryption-role` (pre-flight assert + `files/crypttab-uuid-audit.sh` + `tasks/verify-crypttab.yml`). That guard stays as defense-in-depth; this migration removes the *root cause* it guards against.
+**Status:** gameplan LOCKED (§0), implementation starting. **Priority: HIGH** — a PCIe controller flap on `m-t-proxmox-06` (2026-07-20) re-exposed the pain of device-node-derived names.
+**Scope now:** local HDD/SSD/NVMe. **Designed for** (not built now): true multipath / FC / iSCSI — async device appearance, random ordering (§8).
+**Repos in scope:** `clevis-encryption-role` (owns naming/discovery), `proxmox-install/…/proxmox_encrypted_storage` (ZFS consumer), `encrypted-storage-pool` (btrfs/LVM consumer).
+**Already shipped (PR #15, merged):** the crypttab UUID-collision guard (`files/crypttab-uuid-audit.sh`, pre-flight assert, `verify-crypttab.yml`), the `ansible_devices → ansible_facts["devices"]` swap, the numeric size-sort fix, and the discovery extraction (`tasks/discover-disks.yml`) + device-free tests. That guard stays as defense-in-depth; this work removes the *root cause*.
+
+---
+
+## 0. Locked gameplan (decisions)
+
+1. **Mapper name = `crypt-<LUKS-UUID>`** (keep the `crypt-` prefix; the identity is the LUKS header UUID). Chosen over hardware-id (`crypt-SN_…`/`WWN_…`) because the LUKS UUID is the only identifier that is **still readable mid-incident** — during the 2026-07-20 flap, NVMe SMART/serial queries hung while the LUKS header (and its UUID via `blkid`) was still readable on the re-enumerated nodes — and it is immutable, universal (every device class), and **1:1 with the crypttab source key** (collision-proof, idempotent). Human/physical legibility (serials) is *recoverable* any time via `cryptsetup status` → `/dev/disk/by-id`; naming *stability* is not recoverable if the name is built on a source that vanishes under load. See the discussion trail; this reverses the earlier `luks-<uuid>` prefix only cosmetically — identity was always the LUKS UUID.
+2. **Keeping the `crypt-` prefix is deliberate:** legacy `crypt-<node>` and new `crypt-<uuid>` **share the prefix**, so consumers' existing `^crypt-` matching already tolerates both — no dual-prefix logic. The only consumer fix is to **stop stripping `crypt-` to a device node** and use the full mapper name/path.
+3. **Legacy migration = reboot (default), no resilver.** Rewrite crypttab (match old-*or*-new, write `crypt-<uuid>`, source stays `UUID=`), back it up, reboot. ZFS re-imports by **pool GUID** (`zpool import -d /dev/mapper -o cachefile=none`), btrfs by **fs-UUID** (`device scan`+`LABEL=`), LVM by **PV-UUID** (`vgchange`) — all path/name-agnostic, so they re-attach under the new names with **zero resilver, zero data movement**.
+4. **NEVER `zpool replace` for a rename.** `replace` has install-a-new-blank-device semantics → it forces a **full resilver** and does not diff the target's (identical) content. The no-resilver behavior lives in **import** (GUID match → nothing to resilver) and **online** (`offline→online` → only the small DTL delta). Use those.
+5. **Zero-downtime option (no reboot):** `dmsetup rename crypt-<node> crypt-<uuid>` renames the *live* mapper with no I/O interruption and no resilver (ZFS keeps its open handle; crypttab is updated for persistence; the path label refreshes on next scan). Advanced; reboot is the safe default, especially on flaky hardware where a long operation risks a mid-op flap.
+6. **Both schemes coexist as READ-tolerance during transition; a disk is only ever OPEN under one name.** Two dm-crypt mappers over one LUKS backing = corruption. Cutover is **atomic per disk**; a pool may be a mix of old/new-named vdevs mid-migration (fine — matched by on-disk id).
+7. **Device *selection* is inventory policy, not this role's job** (§2.4). Explicit `clevis_raw_disks` (by stable `/dev/disk/by-id`) is the contract; heuristic auto-discovery is deprecated (already isolated in `discover-disks.yml`).
+8. **Self-healing is a first-class goal, in two tiers (§10)** — live re-unlock+re-attach where redundancy survives; automated reboot-to-deterministic-recovery where the pool wedges. Persistent naming is the *prerequisite* for both, but does not by itself untangle a suspended/held pool.
 
 ---
 
 ## 1. Why, and what this does / does not fix
 
-The reported incident (a ZFS mirror member `UNAVAIL` every boot) was proximately a **duplicate LUKS UUID in `/etc/crypttab`**. The deeper cause is that mapper names are derived from the **unstable kernel device-node name** (`crypt-nvme7n1`) and **re-derived on every apply**. When NVMe probe order reshuffles between a provision and a later re-apply, entries drift and duplicate/stale lines accumulate.
+Mapper names are derived from the **unstable kernel device-node** (`crypt-nvme7n1`) and **re-derived on every apply**. When probe order reshuffles (a reboot, or a controller flap: `nvme2n1`→`nvme2n2` on 2026-07-20), entries drift, stale/duplicate lines accumulate, and `zpool status`/mappers reference nodes that no longer exist. Naming by the immutable **LUKS UUID** makes the name 1:1 with the crypttab key: collisions become structurally impossible, re-applies are idempotent, and the name never lies about a node.
 
-Naming mappers by the immutable **LUKS header UUID** makes the mapper name and the crypttab join key **1:1 and identical**, so:
-
-- A duplicate-UUID collision becomes **structurally impossible** (two entries with the same UUID would be the same mapper name → one idempotent line).
-- Re-applies are **idempotent by UUID** regardless of device-node reshuffling.
-- The name↔disk binding **cannot drift** across reboots or re-applies.
-
-**What this does NOT need to fix (verified in code):** pool durability. All three consumers assemble by **on-disk identity, not mapper name**:
-
-| Consumer | Assembly mechanism | Name-dependent? |
-|---|---|---|
-| ZFS (`proxmox_encrypted_storage`) | `zpool import -d /dev/mapper -o cachefile=none <pool>` — GUID scan | **No** |
-| btrfs (`encrypted-storage-pool`) | `btrfs device scan` + `LABEL=` mount — fs-UUID | **No** |
-| LVM (`encrypted-storage-pool`) | `vgchange -ay <vg>` — PV-UUID metadata | **No** |
-
-So **an existing pool re-assembles cleanly under the new mapper names with zero pool-side surgery**, and a **reboot is the natural cut-over point** (no export/import dance). This is what makes the migration tractable.
+**What this does NOT fix:** pool durability (already GUID/UUID-based — see §0.3), the underlying hardware fault, or the runtime *wedge* when a pool suspends with ZFS holding dead mappers (§10 boundary).
 
 ---
 
 ## 2. Target design
 
 ### 2.1 Naming
-- Mapper name: `luks-<LUKS-UUID>` (e.g. `luks-50ca1601-5785-4ac0-b262-8cae7b29e011`). This is the systemd/anaconda-native convention.
-- crypttab line: `luks-<uuid> UUID=<uuid> none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target`
-  (field 1 == the UUID in field 2; redundant but explicit — field 1 is the dm name, field 2 is the source key.)
-- systemd-escaped unit form (rarely needed; data disks are `noauto`/clevis-opened): `systemd-cryptsetup@luks\x2d<uuid>.service`.
+- Mapper name: `crypt-<LUKS-UUID>` (e.g. `crypt-50ca1601-5785-4ac0-b262-8cae7b29e011`).
+- crypttab line: `crypt-<uuid> UUID=<uuid> none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target` (field 1 = dm name from the LUKS UUID; field 2 = the source key, unchanged — the incident confirmed UUID-keyed source is correct and survives node renaming).
+- Computed **once** at provision/migration and persisted in crypttab; **never recomputed from live facts on later runs** (crypttab is authoritative — avoids any recompute churn).
 
-### 2.2 The identity model (the crux — and what makes multipath tractable later)
-Today the pipeline's interchange token is a **bare kernel device node** (`clevis_raw_disks: [nvme7n1]`, consumer `..._devices: [vdb]`). It is overloaded three ways — the `/dev/<node>` path, the mapper-name suffix, and reverse-derived by stripping `crypt-` — and it is the *least* stable identifier the kernel offers (it changes with probe order, and a multipath LUN has no single node at all). Every failure in this document traces back to that choice.
+### 2.2 The identity model
+The pipeline's interchange token was a **bare kernel device node** — overloaded as the `/dev/<node>` path, the mapper-name suffix, and reverse-derived by stripping `crypt-`. Replace it with **two stable identities per disk**:
 
-The fix is to stop using kernel names as identity and carry **two stable identities per disk, with a clear hand-off:**
+| Identity | Form | Used for |
+|---|---|---|
+| **Hardware id** (pre-LUKS) | `/dev/disk/by-id/…` (`nvme-eui`, `wwn-`, `ata-…-serial`; future `dm-uuid-mpath-<wwid>`) | *selecting* and *formatting* a raw disk |
+| **LUKS id** (post-LUKS) | header UUID → mapper `crypt-<uuid>`, crypttab `UUID=<uuid>` | mapper name, crypttab join, unlock/rotate/audit |
 
-| Identity | Form | Stable across | Used for |
-|---|---|---|---|
-| **Hardware id** (pre-LUKS) | `/dev/disk/by-id/…` — `nvme-<eui>`, `wwn-<…>`, `ata-<model>_<serial>`, and (future) `dm-uuid-mpath-<wwid>` | reboots, probe reorder, path failover | *selecting* and *formatting* a raw disk |
-| **LUKS id** (post-LUKS) | header UUID → mapper `luks-<uuid>`, crypttab `UUID=<uuid>` | forever after format | mapper name, crypttab join, unlock/rotate/audit |
+Hand-off: format the by-id device → read its LUKS UUID → thereafter reference by `crypt-<uuid>` / `/dev/disk/by-uuid/<uuid>`. `tasks/validate-crypttab.yml` already builds the `{dev, uuid, name}` shape as `clevis_crypttab_pairs`. Rules: select/format/rotate via **by-id path** (or by-uuid once formatted), never `/dev/<kernel-name>`; name mappers and write crypttab from the **LUKS UUID**; consumers exchange **full mapper paths**, not bare nodes.
 
-Hand-off: format the by-id device → read its LUKS UUID → thereafter reference it by `luks-<uuid>` / `/dev/disk/by-uuid/<uuid>`. Canonical per-disk record:
+### 2.3 Discovery (shipped hardening + future)
+Shipped in PR #15: reads `ansible_facts["devices"]`, numeric size-sort, extracted to `tasks/discover-disks.yml` behind the `when: clevis_raw_disks is not defined` guard, device-free tests. Still to do (Phase 1+): emit stable by-id paths; **refuse multipath loudly** (`ansible_facts["devices"][<dev>].holders` → dm-mpath) rather than treating N paths as N disks; emit a deprecation `warn` (see §2.4).
 
-```
-{ id: "/dev/disk/by-id/nvme-eui.0025…", uuid: "50ca1601-…", name: "luks-50ca1601-…" }
-```
-
-`tasks/validate-crypttab.yml` (from the guard work) already builds the `{dev, uuid, name}` shape as `clevis_crypttab_pairs`; this migration promotes `dev` from a bare node to a stable by-id path. Rules of thumb:
-- Select/format/rotate a disk via its **by-id path** (or `/dev/disk/by-uuid/<uuid>` once formatted) — never `/dev/<kernel-name>`.
-- Name mappers and write crypttab from the **LUKS UUID** → `luks-<uuid>`.
-- **Consumers exchange full mapper paths** (`/dev/mapper/luks-<uuid>`), not bare nodes — no strip/re-prefix round-trip.
-
-Why this matters beyond the rename: `luks-<uuid>` works identically whether the backing device is a local NVMe or a `/dev/mapper/mpathX`, and a by-id hardware id exists for every device class. Getting this model right **now** (local-only) is what makes the multipath/FC/iSCSI extension (§8) additive rather than a rewrite.
-
-### 2.3 Discovery (local now; multipath-aware later)
-Auto-discovery stays a **local-disk convenience**. Three changes make it correct and safe on the way to multipath:
-
-0. **Read facts via `ansible_facts["devices"]`, not the top-level `ansible_devices`.** Ansible is phasing out injected `ansible_*` fact vars (`inject_facts_as_vars` heading to `false`); `ansible_facts["devices"]` is the durable form. The current discovery `set_fact` (`tasks/main.yml:102`) uses `ansible_devices` and must switch as part of this rework (see §3.1).
-1. **Emit stable by-id paths, not bare kernel names.** The data is already in `ansible_facts["devices"][<dev>].links.ids`; pick a stable id per disk (prefer `nvme-eui`/`wwn-`, fall back to `ata-…-<serial>`).
-2. **Refuse, don't mis-handle, multipath — loudly.** A path device is detectable by a non-empty `ansible_facts["devices"][<dev>].holders` pointing at a dm-mpath device (and `links.ids` containing `dm-uuid-mpath-…`). Until multipath is first-class, discovery must **exclude such paths and fail with a clear message** ("multipath device detected; set clevis_raw_disks explicitly by /dev/disk/by-id") rather than treating the N paths as N disks. (The UUID-collision guard is the backstop if this is bypassed — N paths → one LUKS UUID → it aborts.)
-
-For SAN/multipath and any host with asynchronous device appearance, **explicit device lists (by stable id) are the supported path** — size-group auto-discovery is inherently unreliable when devices arrive late or a LUN is reachable by several nodes. The role already accepts a pre-set `clevis_raw_disks`; the change is that its entries become by-id paths.
-
-### 2.4 Should device selection live in this role at all? (recommendation: no)
-
-**Position: deprecate in-role auto-discovery; make an explicit device list the role's contract.** Choosing *which* physical devices become encrypted storage is a storage-topology / inventory decision — policy — whereas this role is the encryption *mechanism* ("encrypt the devices I'm given, bind Clevis, publish the unlock seam"). Reasons the heuristic doesn't belong here:
-
-- **It's a destructive guess.** The role `luksFormat`s whatever it selects; a wrong guess destroys the wrong disk. A "largest size group" heuristic cannot be made correct in general (it already mis-handles multipath, mixed-size intentional layouts, large OS disks, SANs) — and for a destructive op, explicit beats implicit.
-- **It's a second, divergent source of truth.** The consumers (`proxmox_encrypted_storage`, `encrypted-storage-pool`) own the pool topology and already derive their members from the crypttab this role writes. Selection should flow **one direction**: inventory declares the devices → this role encrypts them + writes crypttab → consumers read crypttab. An independent heuristic here can disagree with what the operator/consumer intends.
-- **It's the untested, bug-prone corner.** Molecule pre-sets `clevis_raw_disks`, so discovery had zero coverage — which is exactly how the lexicographic-sort mis-selection survived. Removing it shrinks the role's risk surface.
-
-**Target contract:** `clevis_raw_disks` is a required input (a list of stable `/dev/disk/by-id/...` identifiers), declared in inventory / host_vars by the caller (the "upstream users"). The role fails fast with a clear message if it is absent.
-
-**Transition (enabled by the extraction in this PR):** the heuristic now lives isolated in `tasks/discover-disks.yml` behind the `when: clevis_raw_disks is not defined` include guard, so it can be staged out without touching the rest of the role:
-1. *Now:* keep it as a clearly-labelled, opt-in, local-only convenience; emit a deprecation `warn` when it runs; refuse multipath loudly (§2.3).
-2. *Later:* flip to required — remove the fallback (or gate it behind an explicit `clevis_allow_disk_autodiscovery: true`), so the default path is always an explicit inventory list.
-
-This is a small, low-risk change precisely because the extraction already isolated it; it does not block the `luks-<uuid>` work and can land on its own.
+### 2.4 Device selection belongs to the caller, not this role
+The role is the encryption *mechanism* ("encrypt the devices I'm given"); *which* devices is a storage-topology/inventory decision. Auto-discovery is a destructive guess, a second source of truth (consumers already derive members from the crypttab this role writes), and the untested corner that hid the sort bug. **Target contract:** explicit `clevis_raw_disks` (by-id), declared in inventory; fail fast if absent. **Transition:** keep the isolated heuristic as an opt-in local convenience with a deprecation `warn`; later gate behind `clevis_allow_disk_autodiscovery: true` or remove.
 
 ---
 
-## 3. Change inventory (from a full three-repo sweep)
+## 3. Change inventory (three-repo sweep; naming = the `crypt-<uuid>` work)
 
-### 3.1 `clevis-encryption-role` — production code (functional)
-
+### 3.1 `clevis-encryption-role` — production code
 | File:line | Class | Change |
 |---|---|---|
-| `templates/clevis-unlock-data.sh.j2:42` | parse | case glob `crypt-*)` → `luks-*)`. **Single functional line** — `$name` is read from crypttab and used verbatim (L47/L66 already name-agnostic). |
-| `tasks/configure-disk.yml:60` | construct | crypttab field 1 → `luks-{{ disk_uuid.stdout }}` (UUID already read at L33). |
-| `tasks/configure-disk.yml:45` | match | `lineinfile regexp` → key on the UUID (`\bUUID=<uuid>\b`) or `^luks-<uuid>\s`. **Hazard:** a new-name regexp won't match a legacy `crypt-<dev>` line → orphaned line; pair with legacy-line removal (§4.3). |
-| `tasks/configure-disk.yml:87,115` | construct | live-mapper probe/`NAME=` → `luks-<uuid>` (backing-device resolution at L126 already dynamic). |
-| `tasks/provision-disk.yml:69,71,76,77,86` | construct | mapper name at luksOpen/close/guards/clevis-unlock. **Must read the LUKS UUID after `luksFormat`** (`cryptsetup luksUUID /dev/<dev>`) — not read there today. |
-| `tasks/validate-crypttab.yml:39` | construct | `name` → `luks-<uuid>` (reorder so the uuid computed at L41-43 is available first). |
-| `tasks/replace-disk.yml:48` | match | remove the **dead** disk's crypttab line. **Hazard:** can't rebuild the name from a bare node and can't `blkid` a removed disk. → match by operator-supplied old UUID, or prune orphan (§4.4). |
-| `tasks/replace-disk.yml:56-60` | parse | re-derive the disk set from `/dev/mapper/crypt-*` by stripping. → grep `^luks-`; stop treating the suffix as a device node (§4.1). |
-| `tasks/rotate-passphrase.yml:18-22` + `:64,73-74,86,97,111,121,130` | parse+construct | **deepest coupling:** strips `crypt-` to a bare node then uses it as `/dev/<node>` for luksAddKey/RemoveKey/clevis regen. → resolve each `luks-*` mapper to its backing device (or use `/dev/disk/by-uuid/<uuid>`) (§4.1). |
-| `tasks/main.yml:98-102` | parse | discovery `set_fact` — rework to emit stable by-id paths + refuse multipath (§2.3), **and switch `ansible_devices` → `ansible_facts["devices"]`** (top-level fact injection is being removed). |
-| `tasks/main.yml:104` | — | reject regex already lists **both** `luks-` and `crypt` → **no change** (open mappers stay filtered under either scheme). |
-| `tasks/boot-ordering-dropins.yml`, `handlers/main.yml`, `tasks/verify-crypttab.yml`, `tasks/assert-crypttab-unique.yml`, `files/crypttab-uuid-audit.sh` | — | **no change** (already name-agnostic; the audit parses crypttab by field, `assert` operates on `clevis_crypttab_pairs`). |
+| `templates/clevis-unlock-data.sh.j2:42` | parse | case glob stays `crypt-*)` — **no change** (both old and new names share the prefix; `$name` is read from crypttab verbatim). |
+| `tasks/configure-disk.yml:60` | construct | crypttab field 1 → `crypt-{{ disk_uuid.stdout }}` (UUID already read at L33). |
+| `tasks/configure-disk.yml:45` | match | `lineinfile regexp` → match the disk's **LUKS UUID in the source** (`\bUUID=<uuid>\b`), so it replaces *either* an old `crypt-<node>` line *or* a `crypt-<uuid>` line for that same volume. Register the change → set `disk_crypttab_changed` (consumers use it to decide migration). |
+| `tasks/configure-disk.yml:87,115` | construct | live-mapper probe/`NAME=` → `crypt-<uuid>` (backing-device resolution at L126 already dynamic). |
+| `tasks/provision-disk.yml:69,71,76,77,86` | construct | mapper name at luksOpen/close/guards/clevis-unlock. **Read the LUKS UUID after `luksFormat`** (`cryptsetup luksUUID /dev/<dev>`). |
+| `tasks/validate-crypttab.yml:39` | construct | `name` → `crypt-<uuid>` (reorder so the uuid is available first). |
+| `tasks/replace-disk.yml:48` | match | remove the **dead** disk's line by its recorded LUKS UUID (`clevis_replace_old_uuid`), not by node. |
+| `tasks/replace-disk.yml:56-60` | parse | re-derive the disk set from open mappers → carry `(dev, uuid)` pairs, not stripped node names (§4.1). |
+| `tasks/rotate-passphrase.yml:18-22`, `:64…130` | parse+construct | **deepest coupling:** stops stripping `crypt-` to a node used as `/dev/<node>`. → resolve each mapper's backing device via `cryptsetup status` or `/dev/disk/by-uuid/<uuid>`. |
+| `tasks/cleanup-legacy.yml` | new | one-time legacy-line reconciliation: for each managed UUID, ensure exactly one `crypt-<uuid>` line, remove any stale `crypt-<node>` line for the same UUID (backed up first). |
 
-### 3.2 `clevis-encryption-role` — tests & docs
-- Molecule/manual: `molecule/default/prepare.yml:136,153,156,158`, `molecule/default/verify.yml:30,40,49`, `molecule/vm/verify.yml:89,96`, `manual_test/verify.yml:35,42` — assertions/opens hardcode `crypt-vdb`/`crypt-<item>`. The `luks-<uuid>` name isn't statically knowable from `[vdb]`, so rework to derive from crypttab or iterate `/dev/mapper/luks-*`.
-- `tests/crypttab-guard/fixtures/*` — update fixture crypttab/pairs to `luks-<uuid>` names for realism (audit + assert are name-agnostic, so tests still pass either way, but should reflect reality).
-- `README.md` — prose + the one escaped unit ref (`systemd-cryptsetup@crypt\x2dnvme7n1.service`, ~L827) and the manual-recovery examples (`crypt-<device>` at ~L229, L771, L828, L832).
+### 3.2 Tests & docs (this role)
+`molecule/default` + `molecule/vm` + `manual_test` verifies hardcode `crypt-<node>`; rework to derive the name from crypttab / iterate `/dev/mapper/crypt-*` (the `<uuid>` isn't statically knowable from `[vdb]`). Update README recovery examples.
 
-### 3.3 `proxmox_encrypted_storage` (ZFS) — only 3 load-bearing sites
-- `tasks/resolve-disks.yml:20` — `awk '/^crypt-/…sub(/^crypt-/…)'` → match `luks-` (and `crypt-` during transition) and **emit the full mapper name/path** (stop stripping to a node).
-- `tasks/setup-pool.yml:108` — vdev spec builds `/dev/mapper/crypt-<node>`; → `/dev/mapper/<full-mapper-name>`.
-- `tasks/replace-disk.yml:40,58` — `zpool status` grep + `/dev/mapper/crypt-<new>` for `zpool replace`.
-- **No change:** `encrypted-storage-import.sh.j2:26`, `setup-pool.yml:39,60,143`, check script, `destroy-pool.yml:24` (reads back ZFS-reported paths), Proxmox registration (keyed on pool name). Molecule `verify.yml:87,94` + the `_disks: [vdb,vdc]` input contract need the new identity model.
+### 3.3 `proxmox_encrypted_storage` (ZFS) — few sites
+- `resolve-disks.yml:20` — stop stripping `crypt-` to a node; emit the full mapper name/path. (`^crypt-` match already covers both old and new.)
+- `setup-pool.yml:108` — vdev spec uses the full mapper name, not `/dev/mapper/crypt-<node>`.
+- `replace-disk.yml:40,58` — `zpool status` grep + replace target by full mapper name.
+- **Add:** a state-aware migration task (§0.3/§10) — detect old-named vdevs, migrate via reboot/import (default) or `dmsetup rename`; **never `zpool replace`** for a pure rename.
+- No change: import/scan (`-d /dev/mapper`, `cachefile=none`), destroy (reads ZFS paths), Proxmox registration (pool name).
 
-### 3.4 `encrypted-storage-pool` (btrfs/LVM) — mirror of the ZFS consumer
-- `tasks/resolve-disks.yml:16` — same regex+strip fix.
-- `tasks/backends/btrfs.yml:14,35`, `tasks/backends/lvm.yml:20,40,49` — stop prepending `/dev/mapper/crypt-`; use `/dev/mapper/` + full mapper name.
-- `molecule/vm/verify.yml:84` — assertion rework.
-- **No change:** `encrypted-storage-assemble.sh.j2`, `encrypted-storage-check.sh.j2` (mount by LABEL / activate by VG — never reference the mapper name).
+### 3.4 `encrypted-storage-pool` (btrfs/LVM) — few sites
+- `resolve-disks.yml:16` — same stop-stripping fix.
+- `backends/btrfs.yml:14,35`, `backends/lvm.yml:20,40,49` — use full mapper name, not re-prefixed node.
+- Boot assembly needs nothing (mounts by LABEL / activates by VG — name-agnostic).
 
 ---
 
-## 4. The six risk items and proposed approach
-
-1. **Reverse-derivation break (`rotate-passphrase`, `replace-disk`, both consumers' `resolve-disks`).** Stripping `luks-` yields a UUID, not a device node. → Carry `(dev, uuid)` pairs (reuse `clevis_crypttab_pairs`); for device-level ops use `/dev/disk/by-uuid/<uuid>` (immutable) or resolve backing device via `cryptsetup status <name>` (pattern already in `configure-disk.yml:126`).
-2. **Dead-disk crypttab-line removal (`replace-disk.yml:48`).** The removed disk can't be probed. → Add `clevis_replace_old_uuid` (operator-supplied) as the deterministic key; optionally offer an orphan-prune (remove any crypttab UUID present on no device — UUID-based, safe, but would also catch a merely-offline disk, so keep it opt-in). The guard's `crypttab-uuid-audit.sh` already *detects* the orphan.
-3. **crypt-→luks- transition leaves orphaned old lines (`configure-disk.yml:45`).** A luks-keyed `lineinfile` won't replace the old `crypt-<dev>` line. → Add an explicit legacy-line removal (in `cleanup-legacy.yml` or a pre-step in `configure-disk`): for each disk, `lineinfile state=absent regexp=^crypt-<dev>\s`. Runs once; idempotent thereafter.
-4. **Provisioning must learn the UUID (`provision-disk.yml`).** → After `luksFormat`, `cryptsetup luksUUID /dev/<dev>` (or `--uuid=` to pin at format), then open `-n luks-<uuid>`.
-5. **Consumer input contract.** `_devices: [vdb, vdc]` (bare nodes) can't be prefixed into a valid mapper path. → Accept full mapper names or `/dev/mapper/...` paths; default (unset) derivation from crypttab returns full names. Document the contract change in both consumers' `defaults`/`argument_specs`/README.
-6. **Mixed fleet during rollout.** → Consumers match `^(crypt|luks)-` and `clevis-unlock-data` can keep opening whatever crypttab lists; a half-migrated host stays bootable. Drop the `crypt-` branch after the whole fleet is migrated.
+## 4. Risk items
+1. **Reverse-derivation break** (`rotate-passphrase`, `replace-disk`, consumers' `resolve-disks`): carry `(dev, uuid)` pairs; device-level ops via `/dev/disk/by-uuid/<uuid>` or `cryptsetup status` backing-device resolution.
+2. **Dead-disk line removal** (`replace-disk`): use operator-supplied `clevis_replace_old_uuid` (deterministic); the audit already *detects* orphans.
+3. **Legacy line handling**: match on the UUID source so the rewrite replaces an old `crypt-<node>` line for the same volume in place — no orphan, no dup. `cleanup-legacy.yml` sweeps any leftover.
+4. **Provisioning learns the UUID**: `cryptsetup luksUUID` after format (or `--uuid=` to pin).
+5. **Consumer input contract**: accept full mapper names/paths; default derivation from crypttab returns full names.
+6. **Never two open mappers on one disk** (§0.6) — corruption.
 
 ---
 
-## 5. Cut-over runbook (per host)
+## 5. Cut-over runbook (per host) — reboot default, no resilver
 
-Precondition: host healthy, pool ONLINE, maintenance window with a reboot allowed.
+Precondition: host healthy, pool `ONLINE`, brief reboot window.
 
-1. **Backup:** `cp -a /etc/crypttab /etc/crypttab.pre-luks-$(date +%s)` (and note current `zpool status -P`).
-2. **Apply the new `clevis-encryption-role`** (`--tags systemd` is enough): rewrites crypttab to `luks-<uuid>`, removes legacy `crypt-` lines, regenerates `clevis-unlock-data` (`luks-*` glob) + boot-ordering. **Running `crypt-*` mappers are untouched** (data disks are `noauto`; the apply does not reopen them). Intermediate state — crypttab=`luks`, live mappers=`crypt`, pool imported on `crypt` paths — is consistent until reboot.
-3. **Audit:** `crypttab-uuid-audit.sh` → expect clean (unique `luks-` entries, all UUIDs present).
-4. **Apply the consumer role(s)** (ZFS and/or btrfs/LVM): resolve/create/replace paths now use full mapper names. Existing pool untouched (assembles by GUID/UUID). Import service already `-d /dev/mapper` (name-agnostic).
-5. **Reboot.** On boot: `clevis-unlock-data` opens `luks-<uuid>` mappers → the pool's scan-import/`btrfs scan`/`vgchange` re-assembles by on-disk identity under the new paths → viability check → `…-ready.target`.
-6. **Verify:** `crypttab-uuid-audit.sh` clean; `ls /dev/mapper/luks-*` present; `zpool status` (or `btrfs`/`lvs`) healthy on `luks-*`/`dm-uuid` paths; consumer ready-target active.
+1. **Backup:** `cp -a /etc/crypttab /etc/crypttab.pre-cryptuuid-$(date +%s)`; note `zpool status -P`.
+2. **Apply the new `clevis-encryption-role`** (`--tags systemd`): rewrites crypttab to `crypt-<uuid>` (UUID-source match → replaces the old `crypt-<node>` line in place), reconciles legacy lines, regenerates boot-ordering. Running mappers are **untouched** (data disks are `noauto`) — intermediate state (crypttab=uuid, live mappers=old) is consistent until reboot.
+3. **Audit:** `crypttab-uuid-audit.sh` → clean (unique `crypt-<uuid>` entries, all UUIDs present).
+4. **Apply consumer role(s):** resolve/create/replace now use full mapper names. Existing pool untouched.
+5. **Reboot.** `clevis-unlock-data` opens `crypt-<uuid>` mappers; ZFS/btrfs/LVM re-attach by GUID/fs-UUID/PV-UUID under the new names — **no resilver**.
+6. **Verify:** audit clean; `ls /dev/mapper/crypt-*`; `zpool status` (or `btrfs`/`lvs`) healthy; consumer `…-ready.target` active.
 
-**Rollback (any step pre- or post-reboot):** restore `/etc/crypttab.pre-luks-*`, redeploy the previous role version, reboot. The pool re-imports by GUID/UUID under the old `crypt-*` names. Low risk because durability never depended on the name.
+**ZFS import paths:** discovery is via `-d /dev/mapper` (the pool lives on dm-crypt devices); `cachefile=none` guarantees a fresh **GUID scan** each boot, never a replay of pinned old paths. (Persistent config lives in `ZPOOL_IMPORT_PATH` / `/etc/default/zfs`; default with no `-d` is a libblkid enumeration.)
 
-**Zero-reboot variant (advanced, not recommended for Proxmox):** stop guests → `zpool export` (or unmount btrfs / `vgchange -an`) → close `crypt-*` → reopen `luks-*` → re-import/scan. A reboot is cleaner on a dedicated box.
+**Rollback (any step):** restore `/etc/crypttab.pre-cryptuuid-*`, redeploy the previous role version, reboot. Pool re-imports by GUID under the old names. Low risk — durability never depended on the name.
+
+**Zero-downtime alternative:** `dmsetup rename` per disk + crypttab update (no reboot, no resilver). Advanced; prefer the reboot on fragile hardware.
 
 ---
 
 ## 6. Test strategy
-- **Device-free (CI):** update `tests/crypttab-guard` fixtures to `luks-<uuid>`; the audit + assert stay green. Add a case proving a re-apply after a simulated node-name reshuffle is a **no-op** under UUID naming (the payoff).
-- **Tier-1 (`molecule/default`):** rework `prepare`/`verify` to open/assert by UUID (`blkid`→`luks-<uuid>`), proving crypttab + live mapper + discard land under the new name.
-- **Tier-2 (`molecule/vm`) — the key one:** provision → assemble pool → **reboot** → verify unlock + pool across the seam, then **re-run the role and assert crypttab is unchanged** (idempotent by UUID). Add, if feasible, a second reboot with a forced device-node reshuffle to prove the pool still comes up (the whole point).
-- **Consumers:** update their `molecule/vm` verify to derive `luks-*` names; confirm an existing pool re-imports after the rename.
+- **Device-free (CI):** `tests/crypttab-guard` + a new case proving a re-apply after a simulated node reshuffle is a **no-op** under UUID naming (the payoff).
+- **Tier-1 (`molecule/default`):** open/assert by UUID (`blkid`→`crypt-<uuid>`).
+- **Tier-2 (`molecule/vm`) — key:** provision → assemble → **reboot** → verify unlock + pool across the seam; then **re-run and assert crypttab unchanged** (idempotent). If feasible, a second reboot with a forced node reshuffle to prove re-attach (the whole point).
+- **Consumers:** verify an existing pool re-imports after the rename; verify the migration task on an old-named pool.
 
 ---
 
-## 7. Sequencing & effort
-
-Phased, each phase shippable and fleet-safe on its own:
-
-- **Phase 1 — `clevis-encryption-role`** (largest): naming in provision/configure/validate/unlock-template + the two hazards (replace, rotate) + legacy-line cleanup + tests + docs. This is the only repo that *must* change for the naming itself.
-- **Phase 2 — consumers** (`proxmox_encrypted_storage`, `encrypted-storage-pool`): 3–5 call sites each + input-contract + tests. Can accept both prefixes, so they can be updated before or after Phase 1 hosts roll.
-- **Phase 3 — fleet rollout**: per-host runbook (§5), one host first, then batch; drop the `crypt-` transition branch once complete.
-
-Rough size: Phase 1 ≈ the bulk (6 task files + 1 template + tests + README); Phases 2 each ≈ a handful of lines + tests. Blast radius is wide but the individual edits are small and mostly mechanical once the `(dev, uuid)` model is in place.
+## 7. Sequencing
+- **Phase 1 — `clevis-encryption-role`**: `crypt-<uuid>` naming in provision/configure/validate + `disk_crypttab_changed` + legacy-line reconcile + rotate/replace rework + tests + docs.
+- **Phase 2 — consumers**: stop-stripping fix + full-mapper-path + the state-aware migration task (§3.3/§10) + tests.
+- **Phase 3 — fleet rollout**: per-host runbook (§5), one host first; drop the transition tolerance once the fleet is fully `crypt-<uuid>`.
 
 ---
 
-## 8. Future extension: true multipath / FC / iSCSI (design target, not built now)
+## 8. Future extension: multipath / FC / iSCSI (design target)
+Additive because identity is by-id + LUKS-UUID and names are `crypt-<uuid>`: a discovery branch that selects the mpath aggregate (`dm-uuid-mpath-<wwid>`) and excludes its paths (`holders`); tolerance for **async device appearance** (apply-time explicit by-id lists; boot-time `udevadm settle` + order after `iscsid`/`multipathd`); ordering chain `network-online → iscsid → multipathd → clevis-unlock-data → clevis-luks-unlocked.target → consumer`. Deferred test lift: a molecule scenario with an iSCSI target + `multipathd` + a path-flap.
 
-Scope now is local HDD/SSD/NVMe. This records what the eventual extension adds so Phase 1 is built to *accommodate* it, not rebuilt for it. Because identity is by-id + LUKS-UUID (§2.2) and mapper names are `luks-<uuid>`, the extension is additive:
+---
 
-- **Discovery branch.** Select the aggregate device (`/dev/disk/by-id/dm-uuid-mpath-<wwid>` / `/dev/mapper/mpathX`) and exclude its path devices via `holders`. WWID is the stable hardware id. LUKS is layered on the mpath device; `blkid` on it yields the LUKS UUID; open as `luks-<uuid>` — the crypttab/naming layer is unchanged.
-- **Asynchronous device appearance.** iSCSI login and FC fabric scans make devices appear late and out of order:
-  - *Apply time:* SAN hosts specify devices explicitly by by-id; size-group auto-discovery is not used (it races device appearance).
-  - *Boot time:* the `clevis-unlock-data` retry loop already distinguishes "device missing" from "decrypt failed" and retries, which tolerates late appearance; add a `udevadm settle` and order unlock **after** `iscsid`/`open-iscsi` login and `multipathd` (`After=`), still in front of the `clevis-luks-unlocked.target` seam.
-- **Random device ordering.** Already solved by the identity model — no kernel name is ever used as identity, so reorder/failover is transparent (by-id hardware id + `luks-<uuid>` + GUID/UUID pool assembly).
-- **Boot-ordering chain (target):** `network-online` → `iscsid` login (`_netdev`) → `multipathd` assembles mpath → `clevis-unlock-data` opens `luks-<uuid>` → `clevis-luks-unlocked.target` → consumer import.
-- **Test infra (deferred):** a molecule scenario with an iSCSI target (LIO/tgt) + `multipathd` exercising provision → unlock → pool across a reboot, plus a forced path-flap. This test lift is the main reason to defer the build.
+## 9. Open decisions
+1. **Dead-disk removal in `replace-disk`:** confirm `clevis_replace_old_uuid` (deterministic) — recommended.
+2. **UUID origin:** `luksFormat --uuid=` (pin, reproducible) vs. read-back — *lean read-back* (simpler; UUID is stable once set).
+3. **Auto-discovery end state:** deprecation-warn now → `clevis_allow_disk_autodiscovery` gate later — confirm the milestone.
+4. ~~**Naming.**~~ *Resolved (§0.1):* `crypt-<LUKS-UUID>`.
+5. ~~**Migration mechanism.**~~ *Resolved (§0.3–0.5):* reboot default (no resilver); `dmsetup rename` zero-downtime option; never `zpool replace`.
+6. **Self-healing scope (§10):** build Tier-1 (live re-unlock+re-attach) now? Add a Tier-2 wedge watchdog (monitor-reboot, or `failmode=panic` + hardware watchdog)? — needs your call.
 
-## 9. Open decisions (need your call before Phase 1)
+---
 
-1. **Dead-disk removal in `replace-disk`:** add `clevis_replace_old_uuid` (deterministic, my recommendation) vs. opt-in orphan-prune vs. both?
-2. **Pin the LUKS UUID at `luksFormat --uuid=` (deterministic, reproducible) vs. read it back after format (simpler)?**
-3. **Keep the `crypt-` transition branch in consumers indefinitely, or set a removal milestone** (e.g. after the fleet is confirmed migrated)?
-4. **Zero-reboot path:** document only, or actually implement the export/reopen/import `--tags migrate` flow for hosts where a reboot is expensive?
-5. ~~**Naming literal.**~~ *Resolved:* `luks-<uuid>`. Multipath/FC/iSCSI have no stable bare node to key on, so the mapper name must come from the LUKS UUID; human-meaningful hardware identity is carried by the separate by-id id (§2.2), not the mapper name.
+## 10. Self-healing / runtime reconciliation (make it more than a boot process)
+
+**Goal:** recover from a controller flap (devices vanish, reappear at new nodes) without a manual full reboot, as far as is *physically* possible.
+
+**What persistent naming buys here:** the re-open is deterministic — `clevis-unlock-data` opens each device by `UUID=` (→ `/dev/disk/by-uuid` → current node) under its stable `crypt-<uuid>` name, regardless of how nodes reshuffled, and re-runs never drift. It is the *prerequisite* for reliable "restart the unit and it comes back." It does **not**, by itself, untangle a wedged pool.
+
+**The honest boundary (from the 2026-07-20 incident).** When redundancy is lost *all at once* — all 6 drives dropped → a full mirror gone → pool **SUSPENDED**, and ZFS holds the dead mappers open (`cryptsetup status` → `device: (null)`; `dmsetup remove` → "Device or resource busy") — the stack **cannot be untangled at runtime**: `luksClose` fails (busy), `zpool export` fails (suspended). No naming scheme or unit restart changes this; it's a ZFS-holds-dead-device + suspended-pool deadlock. **Only a reboot clears it.** Persistent naming makes that reboot recovery *clean and deterministic*, but does not remove the reboot for a total-redundancy-loss event.
+
+**Tier 1 — redundancy preserved (transient / partial flap; pool stays ONLINE/DEGRADED): self-heal live.**
+A device-appearance-triggered reconcile (udev rule / systemd `.device` or path unit, not just boot):
+1. tear down any stale `device:(null)` mapper **iff not busy**;
+2. `clevis-unlock-data` re-opens the device by UUID under `crypt-<uuid>`;
+3. poke the consumer to re-attach — `zpool online`/`clear`, `btrfs device scan`, `vgchange -ay` — **gated on the pool not being suspended**.
+This converts the common case (one bay blips, mirror partner keeps serving) from a manual intervention into automatic recovery. Guard rails: never force-remove a busy mapper, never re-attach to a suspended pool (do no harm).
+
+**Tier 2 — redundancy lost / pool suspended / wedged: not live-recoverable → automate the reboot.**
+The best available "self-heal" is to *detect the wedge and trigger a controlled reboot*, landing in the Tier-0 deterministic boot recovery. Options to decide (§9.6): a small monitor that reboots on sustained suspension + D-state pileup, and/or ZFS `failmode=panic` backed by a hardware/IPMI watchdog. This is a policy choice with real trade-offs (a reboot mid-flaky-hardware buys ~15 min, per the incident) — worth having, but explicitly bounded.
+
+**Ownership:** the LUKS re-unlock is this role's job (`clevis-unlock-data`, already idempotent/re-runnable — the change is to *trigger it on device appearance*, not only at boot); the storage re-attach is the consumer's job, coordinated across the `clevis-luks-unlocked.target` seam.
