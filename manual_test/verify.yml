@@ -31,21 +31,27 @@
       changed_when: false
       failed_when: _svc.stdout != "active"
 
-    - name: "Assert both data mappers are open after boot"
-      ansible.builtin.command: "cryptsetup status crypt-{{ item }}"
+    - name: "Resolve the data mappers' persistent names (crypt-<uuid>)"
+      ansible.builtin.command: "cryptsetup luksUUID /dev/{{ item }}"
       loop: [vdb, vdc]
+      register: _data_uuids
+      changed_when: false
+
+    - name: "Assert both data mappers are open after boot"
+      ansible.builtin.command: "cryptsetup status crypt-{{ item.stdout }}"
+      loop: "{{ _data_uuids.results }}"
       changed_when: false
       loop_control:
-        label: "crypt-{{ item }}"
+        label: "crypt-{{ item.stdout }}"
 
     - name: "Assert allow_discards is durable across the reboot on each mapper"
-      ansible.builtin.command: "dmsetup table crypt-{{ item }}"
-      loop: [vdb, vdc]
+      ansible.builtin.command: "dmsetup table crypt-{{ item.stdout }}"
+      loop: "{{ _data_uuids.results }}"
       register: _dm
       changed_when: false
       failed_when: "'allow_discards' not in _dm.stdout"
       loop_control:
-        label: "crypt-{{ item }}"
+        label: "crypt-{{ item.stdout }}"
 
     - name: "Assert the boot unlock happened (clevis-unlock-data unlocked the disks)"
       ansible.builtin.command: journalctl -b -u clevis-unlock-data.service --no-pager
