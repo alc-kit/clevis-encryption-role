@@ -1,0 +1,65 @@
+---
+# Device-free proof of the Phase-1 crypttab in-place migration CONTRACT used by
+# tasks/configure-disk.yml: a lineinfile keyed on the UUID= SOURCE column
+# rewrites whatever crypt-<name> line already exists for a volume (a legacy
+# crypt-<device-node> line, or the crypt-<uuid> line itself) to the persistent
+# crypt-<uuid> name — IN PLACE, idempotent, orphan-free, and without touching
+# other volumes' lines. run.sh invokes this; a non-zero exit means the migration
+# contract regressed. No block devices, no root.
+- name: "Crypttab in-place UUID migration — contract test"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    ctab: "/tmp/clevis-ct-migrate-test.crypttab"
+    uuid: "50ca1601-5785-4ac0-b262-8cae7b29e011"
+    line: "crypt-{{ uuid }} UUID={{ uuid }} none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target"
+    rx: "^crypt-\\S+\\s+UUID={{ uuid }}\\s"
+  tasks:
+    - name: "Seed a LEGACY node-named line + an unrelated volume"
+      ansible.builtin.copy:
+        dest: "{{ ctab }}"
+        mode: '0600'
+        content: |
+          # header comment
+          crypt-nvme2n1 UUID={{ uuid }} none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target
+          crypt-nvme9n9 UUID=aaaa1111-2222-3333-4444-555555555555 none luks,discard,noauto,nofail,_netdev
+
+    - name: "Rewrite (run 1) — the exact configure-disk lineinfile args"
+      ansible.builtin.lineinfile:
+        path: "{{ ctab }}"
+        regexp: "{{ rx }}"
+        line: "{{ line }}"
+        create: true
+        mode: '0600'
+      register: r1
+
+    - name: "Rewrite (run 2) — must be idempotent"
+      ansible.builtin.lineinfile:
+        path: "{{ ctab }}"
+        regexp: "{{ rx }}"
+        line: "{{ line }}"
+        create: true
+        mode: '0600'
+      register: r2
+
+    - name: "Read the result"
+      ansible.builtin.slurp:
+        src: "{{ ctab }}"
+      register: _out
+
+    - name: "Assert: migrated in place, idempotent, orphan-free, neighbour intact"
+      ansible.builtin.assert:
+        that:
+          - r1 is changed
+          - r2 is not changed
+          - "line in (_out.content | b64decode)"
+          - "'crypt-nvme2n1' not in (_out.content | b64decode)"
+          - "((_out.content | b64decode).split('\n') | select('match', '^crypt-') | list | length) == 2"
+          - "'crypt-nvme9n9' in (_out.content | b64decode)"
+        success_msg: "crypttab in-place UUID migration verified"
+        quiet: true
+
+    - name: "Clean up the scratch crypttab"
+      ansible.builtin.file:
+        path: "{{ ctab }}"
+        state: absent

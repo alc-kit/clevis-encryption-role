@@ -66,6 +66,17 @@ else
   expect_play badtype fail   # empty uuid/type          -> assert fails the play
 fi
 
+# ── Layer 3: crypt-<uuid> in-place migration contract (configure-disk) ────────
+echo
+echo "== Layer 3: crypttab in-place UUID migration (configure-disk contract) =="
+if ! command -v ansible-playbook >/dev/null 2>&1; then
+  echo "SKIP: ansible-playbook not on PATH (Layer 3 skipped)"
+elif ansible-playbook -i 'localhost,' -c local "$HERE/migrate-inplace.yml" >/dev/null 2>&1; then
+  ok "in-place migration: legacy crypt-<node> -> crypt-<uuid>, idempotent, orphan-free"
+else
+  bad "in-place migration (re-run without -q: ansible-playbook -i localhost, -c local $HERE/migrate-inplace.yml)"
+fi
+
 echo
 echo "==== $pass passed, $fail failed ===="
 [ "$fail" -eq 0 ]

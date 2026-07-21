@@ -7,8 +7,9 @@
 #   2. Stands up a LOCAL Tang on 127.0.0.1:7500 (IPv4-only — makes the role's
 #      `clevis_curl_ip_version: auto` probe deterministically resolve to ipv4).
 #   3. LUKS2-formats the real data disk /dev/vdb, clevis-binds it to the local
-#      Tang, and opens it as crypt-vdb (so configure-disk's live-discard apply
-#      has a real clevis-bound, open mapper to refresh).
+#      Tang, and opens it as crypt-<LUKS-UUID> (so configure-disk's live-discard
+#      apply has a real clevis-bound, open mapper — under the persistent name the
+#      role now uses — to refresh).
 #   4. PLANTS legacy artifacts — both role-OWNED (carry the ownership header or a
 #      distinctive signature) and FOREIGN look-alikes (same name, no signature) —
 #      so verify.yml can prove cleanup-legacy removes ours and preserves theirs.
@@ -127,13 +128,24 @@
         content: "molecule-test"
         mode: '0600'
 
+    - name: "Check whether /dev/vdb is already LUKS-formatted"
+      ansible.builtin.command: cryptsetup isLuks /dev/vdb
+      register: _vdb_isluks
+      changed_when: false
+      failed_when: false
+
     - name: "Format /dev/vdb as LUKS2 (fast pbkdf for tests)"
       ansible.builtin.command: >-
         cryptsetup luksFormat --type luks2 --batch-mode
         --pbkdf pbkdf2 --pbkdf-force-iterations 1000
         /dev/vdb /root/molecule_luks.key
-      args:
-        creates: "/dev/mapper/crypt-vdb"
+      changed_when: true
+      when: _vdb_isluks.rc != 0
+
+    - name: "Read the LUKS UUID of /dev/vdb (the role names the mapper crypt-<uuid>)"
+      ansible.builtin.command: cryptsetup luksUUID /dev/vdb
+      register: _vdb_uuid
+      changed_when: false
 
     - name: "Check whether /dev/vdb is already clevis-bound"
       ansible.builtin.command: "clevis luks list -d /dev/vdb"
@@ -150,12 +162,12 @@
       when: "'tang' not in (_clevis_list.stdout | default(''))"
       changed_when: true
 
-    - name: "Open LUKS device as crypt-vdb (no discard yet — role applies it)"
+    - name: "Open the LUKS device as crypt-<uuid> (no discard yet — role applies it)"
       ansible.builtin.command: >-
         cryptsetup luksOpen --key-file /root/molecule_luks.key
-        /dev/vdb crypt-vdb
+        /dev/vdb "crypt-{{ _vdb_uuid.stdout }}"
       args:
-        creates: "/dev/mapper/crypt-vdb"
+        creates: "/dev/mapper/crypt-{{ _vdb_uuid.stdout }}"
 
     # ── Plant legacy artifacts for the cleanup-legacy content-guard test ──────
     # OWNED (must be REMOVED): carry the ownership header or a distinctive

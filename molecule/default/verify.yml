@@ -18,16 +18,21 @@
 
   tasks:
 
+    - name: "Read the data disk's LUKS UUID (the mapper is named crypt-<uuid>)"
+      ansible.builtin.command: cryptsetup luksUUID /dev/vdb
+      register: _vdb_uuid
+      changed_when: false
+
     # ── 1. crypttab ──────────────────────────────────────────────────────────
     - name: "Read /etc/crypttab"
       ansible.builtin.slurp:
         src: /etc/crypttab
       register: _crypttab
 
-    - name: "Assert crypttab contains crypt-vdb with correct flags"
+    - name: "Assert crypttab has the crypt-<uuid> entry with correct flags"
       ansible.builtin.assert:
         that:
-          - "'crypt-vdb' in (_crypttab.content | b64decode)"
+          - "('crypt-' ~ _vdb_uuid.stdout) in (_crypttab.content | b64decode)"
           - "'_netdev' in (_crypttab.content | b64decode)"
           - "'x-systemd.after=network-online.target' in (_crypttab.content | b64decode)"
           - "'discard' in (_crypttab.content | b64decode)"
@@ -35,25 +40,25 @@
         fail_msg: "/etc/crypttab does not have the expected crypt-vdb entry"
 
     # ── 2. mapper open + live discard applied by configure-disk ──────────────
-    - name: "Assert /dev/mapper/crypt-vdb exists"
+    - name: "Assert /dev/mapper/crypt-<uuid> exists"
       ansible.builtin.stat:
-        path: /dev/mapper/crypt-vdb
+        path: "/dev/mapper/crypt-{{ _vdb_uuid.stdout }}"
       register: _mapper
 
     - name: "Fail if mapper device is absent"
       ansible.builtin.assert:
         that: _mapper.stat.exists
-        fail_msg: "/dev/mapper/crypt-vdb is not present — LUKS device was not opened"
+        fail_msg: "/dev/mapper/crypt-{{ _vdb_uuid.stdout }} is not present — LUKS device was not opened"
 
-    - name: "Read cryptsetup status for crypt-vdb"
-      ansible.builtin.command: cryptsetup status crypt-vdb
+    - name: "Read cryptsetup status for the crypt-<uuid> mapper"
+      ansible.builtin.command: "cryptsetup status crypt-{{ _vdb_uuid.stdout }}"
       register: _cs_status
       changed_when: false
 
     - name: "Fail if discards not active on mapper (configure-disk live-apply)"
       ansible.builtin.assert:
         that: "'discards' in _cs_status.stdout"
-        fail_msg: "discards flag is not active on crypt-vdb — clevis live-refresh did not apply"
+        fail_msg: "discards flag is not active on crypt-{{ _vdb_uuid.stdout }} — clevis live-refresh did not apply"
 
     # ── 3. curlrc IP-family auto-probe ───────────────────────────────────────
     - name: "Read the clevis curlrc"
