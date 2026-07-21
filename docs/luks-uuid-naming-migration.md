@@ -11,12 +11,13 @@
 
 1. **Mapper name = `crypt-<LUKS-UUID>`** (keep the `crypt-` prefix; the identity is the LUKS header UUID). Chosen over hardware-id (`crypt-SN_…`/`WWN_…`) because the LUKS UUID is the only identifier that is **still readable mid-incident** — during the 2026-07-20 flap, NVMe SMART/serial queries hung while the LUKS header (and its UUID via `blkid`) was still readable on the re-enumerated nodes — and it is immutable, universal (every device class), and **1:1 with the crypttab source key** (collision-proof, idempotent). Human/physical legibility (serials) is *recoverable* any time via `cryptsetup status` → `/dev/disk/by-id`; naming *stability* is not recoverable if the name is built on a source that vanishes under load. See the discussion trail; this reverses the earlier `luks-<uuid>` prefix only cosmetically — identity was always the LUKS UUID.
 2. **Keeping the `crypt-` prefix is deliberate:** legacy `crypt-<node>` and new `crypt-<uuid>` **share the prefix**, so consumers' existing `^crypt-` matching already tolerates both — no dual-prefix logic. The only consumer fix is to **stop stripping `crypt-` to a device node** and use the full mapper name/path.
-3. **Legacy migration = reboot (default), no resilver.** Rewrite crypttab (match old-*or*-new, write `crypt-<uuid>`, source stays `UUID=`), back it up, reboot. ZFS re-imports by **pool GUID** (`zpool import -d /dev/mapper -o cachefile=none`), btrfs by **fs-UUID** (`device scan`+`LABEL=`), LVM by **PV-UUID** (`vgchange`) — all path/name-agnostic, so they re-attach under the new names with **zero resilver, zero data movement**.
-4. **NEVER `zpool replace` for a rename.** `replace` has install-a-new-blank-device semantics → it forces a **full resilver** and does not diff the target's (identical) content. The no-resilver behavior lives in **import** (GUID match → nothing to resilver) and **online** (`offline→online` → only the small DTL delta). Use those.
-5. **Zero-downtime option (no reboot):** `dmsetup rename crypt-<node> crypt-<uuid>` renames the *live* mapper with no I/O interruption and no resilver (ZFS keeps its open handle; crypttab is updated for persistence; the path label refreshes on next scan). Advanced; reboot is the safe default, especially on flaky hardware where a long operation risks a mid-op flap.
-6. **Both schemes coexist as READ-tolerance during transition; a disk is only ever OPEN under one name.** Two dm-crypt mappers over one LUKS backing = corruption. Cutover is **atomic per disk**; a pool may be a mix of old/new-named vdevs mid-migration (fine — matched by on-disk id).
-7. **Device *selection* is inventory policy, not this role's job** (§2.4). Explicit `clevis_raw_disks` (by stable `/dev/disk/by-id`) is the contract; heuristic auto-discovery is deprecated (already isolated in `discover-disks.yml`).
-8. **Self-healing is a first-class goal, in two tiers (§10)** — live re-unlock+re-attach where redundancy survives; automated reboot-to-deterministic-recovery where the pool wedges. Persistent naming is the *prerequisite* for both, but does not by itself untangle a suspended/held pool.
+3. **Legacy migration = no resilver, and — for live-workload hosts — no reboot.** Rewrite crypttab (match old-*or*-new, write `crypt-<uuid>`, source stays `UUID=`), back it up. Preferred for live hosts: **`dmsetup rename`** the live mappers (§0.5). Simpler fallback (operator-scheduled maintenance window only): reboot. Either way ZFS re-imports by **pool GUID** (`zpool import -d /dev/mapper -o cachefile=none`), btrfs by **fs-UUID**, LVM by **PV-UUID** — path/name-agnostic → **zero resilver, zero data movement**.
+4. **NEVER `zpool replace` for a rename.** `replace` = install-a-new-blank-device → forces a **full resilver** and does not diff the (identical) content. The no-resilver behavior lives in **import** (GUID match) and **online** (`offline→online` → small DTL delta only). Use those.
+5. **`dmsetup rename crypt-<node> crypt-<uuid>` is the preferred live migration:** renames the running mapper with no I/O interruption and no resilver (ZFS keeps its open handle by dev-number; crypttab is updated for persistence; the stale on-disk path label self-corrects on the next operator-planned import/boot). Per disk, atomic.
+6. **NEVER automated reboots.** Live workloads must be drained/managed by the operator first. Any reboot (migration fallback, or clearing a wedge) is an **operator-initiated, workload-managed** action — never triggered by the role or a watchdog.
+7. **Both schemes coexist as READ-tolerance during transition; a disk is only ever OPEN under one name.** Two dm-crypt mappers over one LUKS backing = corruption. Cutover is **atomic per disk**; a pool may be a mix of old/new-named vdevs mid-migration (fine — matched by on-disk id).
+8. **Device *selection* is inventory policy, not this role's job** (§2.4). Explicit `clevis_raw_disks` (by stable `/dev/disk/by-id`) is the contract; heuristic auto-discovery is deprecated (already isolated in `discover-disks.yml`).
+9. **Self-healing (§10): live reconcile only, split along the `clevis-luks-unlocked.target` seam.** clevis-encryption-role owns the LUKS half (device-appearance-triggered re-unlock), the ZFS/btrfs/LVM consumer owns the storage re-attach half (non-disruptive; ZED for ZFS). They rendezvous on the reappeared `/dev/mapper/crypt-<uuid>` — no direct cross-repo calls. When redundancy is lost (pool suspended/wedged), reconcile **stands down**: detect + alert, leave the reboot to the operator. Persistent naming is the prerequisite (stable rendezvous path) but does not untangle a held/suspended pool.
 
 ---
 
@@ -96,22 +97,24 @@ The role is the encryption *mechanism* ("encrypt the devices I'm given"); *which
 
 ---
 
-## 5. Cut-over runbook (per host) — reboot default, no resilver
+## 5. Cut-over runbook (per host) — no resilver; no reboot for live hosts
 
-Precondition: host healthy, pool `ONLINE`, brief reboot window.
+Precondition: host healthy, pool `ONLINE`. Common steps 1–4, then pick Path A (live) or Path B (operator-scheduled window).
 
 1. **Backup:** `cp -a /etc/crypttab /etc/crypttab.pre-cryptuuid-$(date +%s)`; note `zpool status -P`.
-2. **Apply the new `clevis-encryption-role`** (`--tags systemd`): rewrites crypttab to `crypt-<uuid>` (UUID-source match → replaces the old `crypt-<node>` line in place), reconciles legacy lines, regenerates boot-ordering. Running mappers are **untouched** (data disks are `noauto`) — intermediate state (crypttab=uuid, live mappers=old) is consistent until reboot.
+2. **Apply the new `clevis-encryption-role`** (`--tags systemd`): rewrites crypttab to `crypt-<uuid>` (UUID-source match → replaces the old `crypt-<node>` line in place), reconciles legacy lines, regenerates boot-ordering. Running mappers are **untouched** (data disks are `noauto`).
 3. **Audit:** `crypttab-uuid-audit.sh` → clean (unique `crypt-<uuid>` entries, all UUIDs present).
 4. **Apply consumer role(s):** resolve/create/replace now use full mapper names. Existing pool untouched.
-5. **Reboot.** `clevis-unlock-data` opens `crypt-<uuid>` mappers; ZFS/btrfs/LVM re-attach by GUID/fs-UUID/PV-UUID under the new names — **no resilver**.
-6. **Verify:** audit clean; `ls /dev/mapper/crypt-*`; `zpool status` (or `btrfs`/`lvs`) healthy; consumer `…-ready.target` active.
 
-**ZFS import paths:** discovery is via `-d /dev/mapper` (the pool lives on dm-crypt devices); `cachefile=none` guarantees a fresh **GUID scan** each boot, never a replay of pinned old paths. (Persistent config lives in `ZPOOL_IMPORT_PATH` / `/etc/default/zfs`; default with no `-d` is a libblkid enumeration.)
+**Path A — live, no reboot (preferred for hosts with running workloads):** per disk, atomically `dmsetup rename crypt-<node> crypt-<uuid>`. The running mapper keeps serving (ZFS/btrfs/LVM hold it by dev-number); no resilver, no I/O interruption. crypttab (step 2) already carries the new name for persistence; ZFS's stale on-disk path label self-corrects at the next operator-planned import. Verify after each: `zpool status`/`lsblk` still healthy.
 
-**Rollback (any step):** restore `/etc/crypttab.pre-cryptuuid-*`, redeploy the previous role version, reboot. Pool re-imports by GUID under the old names. Low risk — durability never depended on the name.
+**Path B — operator-scheduled maintenance window (simpler):** drain/stop the tenant workloads, then reboot. `clevis-unlock-data` opens `crypt-<uuid>` mappers; ZFS/btrfs/LVM re-attach by GUID/fs-UUID/PV-UUID — **no resilver**. Never automate this reboot (§0.6).
 
-**Zero-downtime alternative:** `dmsetup rename` per disk + crypttab update (no reboot, no resilver). Advanced; prefer the reboot on fragile hardware.
+5. **Verify:** audit clean; `ls /dev/mapper/crypt-*`; `zpool status` (or `btrfs`/`lvs`) healthy; consumer `…-ready.target` active.
+
+**ZFS import paths:** discovery is via `-d /dev/mapper` (the pool lives on dm-crypt devices); `cachefile=none` guarantees a fresh **GUID scan** each import, never a replay of pinned old paths. (Persistent config lives in `ZPOOL_IMPORT_PATH` / `/etc/default/zfs`; default with no `-d` is a libblkid enumeration.)
+
+**Rollback:** restore `/etc/crypttab.pre-cryptuuid-*`, redeploy the previous role version; re-attach by GUID under the old names (Path A: `dmsetup rename` back; Path B: reboot in a managed window). Low risk — durability never depended on the name.
 
 ---
 
@@ -140,8 +143,8 @@ Additive because identity is by-id + LUKS-UUID and names are `crypt-<uuid>`: a d
 2. **UUID origin:** `luksFormat --uuid=` (pin, reproducible) vs. read-back — *lean read-back* (simpler; UUID is stable once set).
 3. **Auto-discovery end state:** deprecation-warn now → `clevis_allow_disk_autodiscovery` gate later — confirm the milestone.
 4. ~~**Naming.**~~ *Resolved (§0.1):* `crypt-<LUKS-UUID>`.
-5. ~~**Migration mechanism.**~~ *Resolved (§0.3–0.5):* reboot default (no resilver); `dmsetup rename` zero-downtime option; never `zpool replace`.
-6. **Self-healing scope (§10):** build Tier-1 (live re-unlock+re-attach) now? Add a Tier-2 wedge watchdog (monitor-reboot, or `failmode=panic` + hardware watchdog)? — needs your call.
+5. ~~**Migration mechanism.**~~ *Resolved (§0.3–0.6):* no resilver; **`dmsetup rename` (live, no reboot) preferred** for hosts with running workloads; operator-scheduled maintenance-window reboot as the simpler fallback; **never `zpool replace`**; **never automate a reboot**.
+6. ~~**Self-healing scope.**~~ *Resolved (§10):* build **Tier-1 live reconcile** (split along the seam — LUKS half here, storage half in the consumer via ZED). **Tier-2 = detect + alert only, NO auto-reboot** (`failmode=panic`/watchdog rejected). Reboots are always operator-initiated after workload management.
 
 ---
 
@@ -160,7 +163,15 @@ A device-appearance-triggered reconcile (udev rule / systemd `.device` or path u
 3. poke the consumer to re-attach — `zpool online`/`clear`, `btrfs device scan`, `vgchange -ay` — **gated on the pool not being suspended**.
 This converts the common case (one bay blips, mirror partner keeps serving) from a manual intervention into automatic recovery. Guard rails: never force-remove a busy mapper, never re-attach to a suspended pool (do no harm).
 
-**Tier 2 — redundancy lost / pool suspended / wedged: not live-recoverable → automate the reboot.**
-The best available "self-heal" is to *detect the wedge and trigger a controlled reboot*, landing in the Tier-0 deterministic boot recovery. Options to decide (§9.6): a small monitor that reboots on sustained suspension + D-state pileup, and/or ZFS `failmode=panic` backed by a hardware/IPMI watchdog. This is a policy choice with real trade-offs (a reboot mid-flaky-hardware buys ~15 min, per the incident) — worth having, but explicitly bounded.
+**Tier 2 — redundancy lost / pool suspended / wedged: NOT live-recoverable, and we do NOT auto-reboot.**
+Live workloads must be drained/managed by a human before any reboot, so the reconcile **stands down**: detect the wedge, log it, and **alert loudly** (a failed/monitored unit state, a journal marker). It takes no destructive action and never reboots. Clearing the wedge — drain the tenant, then reboot into the deterministic `crypt-<uuid>` recovery — is an explicit operator decision. (`failmode=panic` + watchdog is deliberately **rejected** for the same reason.)
 
-**Ownership:** the LUKS re-unlock is this role's job (`clevis-unlock-data`, already idempotent/re-runnable — the change is to *trigger it on device appearance*, not only at boot); the storage re-attach is the consumer's job, coordinated across the `clevis-luks-unlocked.target` seam.
+### 10.1 Ownership — split along the `clevis-luks-unlocked.target` seam (same boundary as boot)
+
+The reconcile is the boot flow re-shaped around a device event, so it splits on the same boundary:
+
+- **`clevis-encryption-role` — the LUKS half.** A device-appearance trigger (udev rule / systemd `.device` unit on `crypto_LUKS` add) → tear down a stale `device:(null)` mapper *iff not busy* → re-run `clevis-unlock-data` (already idempotent) to open the device by UUID as `crypt-<uuid>` → (re)reach `clevis-luks-unlocked.target`. It **never** runs `zpool`/`btrfs`/`vgchange`.
+- **`proxmox_encrypted_storage` / `encrypted-storage-pool` — the storage half.** Notice the expected `/dev/mapper/crypt-<uuid>` reappear → re-attach the member **non-disruptively**: for ZFS prefer native **ZED** auto-online (built for "the vdev's device came back"), else a health-gated `zpool online`/`clear`; btrfs `device scan`; LVM `vgchange -ay`. It **never** runs cryptsetup/clevis, never `export`/reimports live, never acts on a suspended pool.
+- **Rendezvous on the artifact, not by direct calls.** clevis produces the open mapper at the stable `/dev/mapper/crypt-<uuid>` path (persistent naming is what makes that path predictable); the consumer keys off it appearing — exactly as it already derives members from crypttab/mappers. clevis has no knowledge of the consumer; the seam remains the only contract, which keeps this role NBDE-only and reusable across all three storage backends.
+
+**Do-no-harm invariants (both halves):** never force-remove a busy mapper; never re-attach to a suspended pool; every action must be additive (restore redundancy) and safe against the running workload.
