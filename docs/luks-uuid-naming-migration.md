@@ -16,7 +16,7 @@
 5. **`dmsetup rename crypt-<node> crypt-<uuid>` is the preferred live migration:** renames the running mapper with no I/O interruption and no resilver (ZFS keeps its open handle by dev-number; crypttab is updated for persistence; the stale on-disk path label self-corrects on the next operator-planned import/boot). Per disk, atomic.
 6. **NEVER automated reboots.** Live workloads must be drained/managed by the operator first. Any reboot (migration fallback, or clearing a wedge) is an **operator-initiated, workload-managed** action — never triggered by the role or a watchdog.
 7. **Both schemes coexist as READ-tolerance during transition; a disk is only ever OPEN under one name.** Two dm-crypt mappers over one LUKS backing = corruption. Cutover is **atomic per disk**; a pool may be a mix of old/new-named vdevs mid-migration (fine — matched by on-disk id).
-8. **Device *selection* is inventory policy, not this role's job** (§2.4). Explicit `clevis_raw_disks` (by stable `/dev/disk/by-id`) is the contract; heuristic auto-discovery is deprecated (already isolated in `discover-disks.yml`).
+8. **Producer/consumer contract (§2.4): the caller owns the device list; clevis is a pure enriching function; the contract is a naming *convention*, not a file.** The caller/inventory provides the list as stable `/dev/disk/by-id` ids; clevis LUKS-formats each and returns the list enriched with its `crypt-<uuid>` name (an ephemeral in-play fact — **no host file**). The authoritative, always-derivable contract is the rule `mapper = crypt-<LUKS-UUID>`. Consumers derive their encrypted members from their *own* list and decide *all* topology. In-role auto-discovery is **retired**.
 9. **Self-healing (§10): live reconcile only, split along the `clevis-luks-unlocked.target` seam.** clevis-encryption-role owns the LUKS half (device-appearance-triggered re-unlock), the ZFS/btrfs/LVM consumer owns the storage re-attach half (non-disruptive; ZED for ZFS). They rendezvous on the reappeared `/dev/mapper/crypt-<uuid>` — no direct cross-repo calls. When redundancy is lost (pool suspended/wedged), reconcile **stands down**: detect + alert, leave the reboot to the operator. Persistent naming is the prerequisite (stable rendezvous path) but does not untangle a held/suspended pool.
 
 ---
@@ -46,11 +46,31 @@ The pipeline's interchange token was a **bare kernel device node** — overloade
 
 Hand-off: format the by-id device → read its LUKS UUID → thereafter reference by `crypt-<uuid>` / `/dev/disk/by-uuid/<uuid>`. `tasks/validate-crypttab.yml` already builds the `{dev, uuid, name}` shape as `clevis_crypttab_pairs`. Rules: select/format/rotate via **by-id path** (or by-uuid once formatted), never `/dev/<kernel-name>`; name mappers and write crypttab from the **LUKS UUID**; consumers exchange **full mapper paths**, not bare nodes.
 
-### 2.3 Discovery (shipped hardening + future)
-Shipped in PR #15: reads `ansible_facts["devices"]`, numeric size-sort, extracted to `tasks/discover-disks.yml` behind the `when: clevis_raw_disks is not defined` guard, device-free tests. Still to do (Phase 1+): emit stable by-id paths; **refuse multipath loudly** (`ansible_facts["devices"][<dev>].holders` → dm-mpath) rather than treating N paths as N disks; emit a deprecation `warn` (see §2.4).
+### 2.3 Discovery — retired
+Auto-discovery does not belong in this role (§2.4): the device list always comes from the caller. `tasks/discover-disks.yml` (extracted + hardened in PR #15 — `ansible_facts["devices"]`, numeric size-sort, device-free tests) is therefore **retired**: emit a deprecation `warn` when it runs, then remove it. No more "which disks?" heuristic, no in-role multipath detection (multipath identity is just a `by-id` form in the caller's list — see §2.4).
 
-### 2.4 Device selection belongs to the caller, not this role
-The role is the encryption *mechanism* ("encrypt the devices I'm given"); *which* devices is a storage-topology/inventory decision. Auto-discovery is a destructive guess, a second source of truth (consumers already derive members from the crypttab this role writes), and the untested corner that hid the sort bug. **Target contract:** explicit `clevis_raw_disks` (by-id), declared in inventory; fail fast if absent. **Transition:** keep the isolated heuristic as an opt-in local convenience with a deprecation `warn`; later gate behind `clevis_allow_disk_autodiscovery: true` or remove.
+### 2.4 Producer/consumer contract (encrypted devices) — topology-free, file-free
+
+**Roles**
+- **Caller (inventory / site playbook)** owns the device list — the *separated root hardware devices*, as stable `/dev/disk/by-id/…` ids. Choosing which disks are encrypted is inventory policy; in-role auto-discovery is retired (the list always comes from the caller).
+- **clevis-encryption-role is a pure enriching function** over that list: given `[hardware devices]` it LUKS-formats + Clevis-binds + opens each as `crypt-<LUKS-UUID>`, writes crypttab, and returns the list **enriched** with each device's paired encrypted name. It invents no list and decides no topology.
+- **The consumer** (`proxmox_encrypted_storage` / `encrypted-storage-pool` / any framework) takes the encrypted devices and does whatever it likes — partition them, join partitions across devices, mirror/stripe/raidz. It derives its encrypted members from *its own* provided list.
+
+**The contract is a naming convention, not an artifact.** The one durable rule:
+> a device's encrypted name is `crypt-<its-LUKS-UUID>` — mapper `/dev/mapper/crypt-<uuid>`, crypttab source `UUID=<uuid>`.
+
+Given that rule and a hardware device, the pairing is *derivable*: `mapper(x) = /dev/mapper/crypt-$(blkid -s UUID -o value x)`. So the mapping is **never stored**. The only persisted artifacts are the ones that must exist anyway — the on-disk LUKS header, the crypttab line, the open mapper. **No `encrypted-devices.json` or any spare file:** a stored mapping is just a cache of a pure function and a guaranteed source of drift/rot.
+
+**Enrichment is in-band and ephemeral.** clevis returns the enriched list as a per-play Ansible fact `clevis_encrypted_devices = [{hardware: <by-id>, luks_uuid, mapper: /dev/mapper/crypt-<uuid>}]` — in memory, no file. It is a *convenience* for the common composed case (the consumer runs right after clevis in one play). Nothing may *depend* on it: a standalone consumer re-derives the identical pairing from its own by-id list via the convention. One authoritative truth (convention + live devices); one optional shortcut (the fact).
+
+**Transport lives in one column only.** The `hardware` id is the sole place local/remote/multipath identity appears (local → `nvme-eui`/`wwn-`; multipath → `dm-uuid-mpath-<wwid>`). Everything downstream references the transport-neutral `mapper`. Assembly is transport-agnostic; selection uses the transport-uniform `by-id`.
+
+**Validation.** A consumer that lists a device with no LUKS UUID (clevis never encrypted it) must **fail loudly** — "you asked for a device that isn't an encrypted member."
+
+**Work items.**
+- clevis: accept the caller's `/dev/disk/by-id/…` list as `clevis_raw_disks`; provision/`blkid` via those paths; publish the ephemeral `clevis_encrypted_devices` fact; retire `discover-disks`.
+- consumers: derive members from their *own* by-id list (via the convention, or the fact when composed); keep their own topology. The reintroduced consumer "device list" is the caller's by-id subset — **never bare nodes, never a topology schema clevis defines**. (This supersedes the earlier "deprecate the consumer list" idea: the list is not deprecated, it is the caller's by-id subset selector.)
+- No host files introduced anywhere.
 
 ---
 
@@ -73,17 +93,19 @@ The role is the encryption *mechanism* ("encrypt the devices I'm given"); *which
 ### 3.2 Tests & docs (this role)
 `molecule/default` + `molecule/vm` + `manual_test` verifies hardcode `crypt-<node>`; rework to derive the name from crypttab / iterate `/dev/mapper/crypt-*` (the `<uuid>` isn't statically knowable from `[vdb]`). Update README recovery examples.
 
-### 3.3 `proxmox_encrypted_storage` (ZFS) — few sites
-- `resolve-disks.yml:20` — stop stripping `crypt-` to a node; emit the full mapper name/path. (`^crypt-` match already covers both old and new.)
-- `setup-pool.yml:108` — vdev spec uses the full mapper name, not `/dev/mapper/crypt-<node>`.
-- `replace-disk.yml:40,58` — `zpool status` grep + replace target by full mapper name.
-- **Add:** a state-aware migration task (§0.3/§10) — detect old-named vdevs, migrate via reboot/import (default) or `dmsetup rename`; **never `zpool replace`** for a pure rename.
+Both consumers follow the §2.4 contract: `resolve-disks` derives members from the **caller's own `by-id` list** — `blkid <by-id>` → `crypt-<uuid>` mapper (the naming convention), or read the ephemeral `clevis_encrypted_devices` fact when composed. The crypttab-derive-*all* path stays only as the no-list convenience. Topology stays the consumer's.
+
+### 3.3 `proxmox_encrypted_storage` (ZFS)
+- `resolve-disks.yml` — resolve from the caller's by-id list per §2.4 → full `/dev/mapper/crypt-<uuid>` paths; fail loudly on a listed device with no LUKS UUID. Stop stripping `crypt-` to a node.
+- `setup-pool.yml` — vdev spec consumes the resolved full mapper paths.
+- `replace-disk.yml` — `zpool status` grep + replace target by full mapper path.
+- **Add:** a state-aware migration task (§0.3/§10) — detect old-named vdevs, migrate via `dmsetup rename` (live, preferred) or an operator-scheduled reboot; **never `zpool replace`** for a pure rename.
 - No change: import/scan (`-d /dev/mapper`, `cachefile=none`), destroy (reads ZFS paths), Proxmox registration (pool name).
 
-### 3.4 `encrypted-storage-pool` (btrfs/LVM) — few sites
-- `resolve-disks.yml:16` — same stop-stripping fix.
-- `backends/btrfs.yml:14,35`, `backends/lvm.yml:20,40,49` — use full mapper name, not re-prefixed node.
-- Boot assembly needs nothing (mounts by LABEL / activates by VG — name-agnostic).
+### 3.4 `encrypted-storage-pool` (btrfs/LVM)
+- `resolve-disks.yml` — same §2.4 by-id-derive → full mapper paths. (The earlier deprecation-warning commit on `feat/crypt-uuid-consumer` is superseded by this and must be reworked to the by-id-derive model.)
+- `backends/btrfs.yml`, `backends/lvm.yml` — consume the resolved full mapper paths (drop the `crypt-` re-prefix).
+- Boot assembly needs nothing (mounts by LABEL / activates by VG — name-agnostic). The `molecule/rename` scenario (validated) proves the live-rename mechanism.
 
 ---
 
@@ -141,7 +163,8 @@ Additive because identity is by-id + LUKS-UUID and names are `crypt-<uuid>`: a d
 ## 9. Open decisions
 1. **Dead-disk removal in `replace-disk`:** confirm `clevis_replace_old_uuid` (deterministic) — recommended.
 2. **UUID origin:** `luksFormat --uuid=` (pin, reproducible) vs. read-back — *lean read-back* (simpler; UUID is stable once set).
-3. **Auto-discovery end state:** deprecation-warn now → `clevis_allow_disk_autodiscovery` gate later — confirm the milestone.
+3. ~~**Auto-discovery end state.**~~ *Resolved (§2.4):* the caller owns the by-id device list; in-role auto-discovery is **retired** (`discover-disks` gets a deprecation `warn`, then removal).
+7. ~~**Producer/consumer contract.**~~ *Resolved (§2.4):* caller owns the by-id list; clevis is a pure enriching function returning an ephemeral `clevis_encrypted_devices` fact; the authoritative contract is the convention `mapper = crypt-<LUKS-UUID>` (always derivable, **no host file**); consumers derive their members from their own list and own all topology.
 4. ~~**Naming.**~~ *Resolved (§0.1):* `crypt-<LUKS-UUID>`.
 5. ~~**Migration mechanism.**~~ *Resolved (§0.3–0.6):* no resilver; **`dmsetup rename` (live, no reboot) preferred** for hosts with running workloads; operator-scheduled maintenance-window reboot as the simpler fallback; **never `zpool replace`**; **never automate a reboot**.
 6. ~~**Self-healing scope.**~~ *Resolved (§10):* build **Tier-1 live reconcile** (split along the seam — LUKS half here, storage half in the consumer via ZED). **Tier-2 = detect + alert only, NO auto-reboot** (`failmode=panic`/watchdog rejected). Reboots are always operator-initiated after workload management.
