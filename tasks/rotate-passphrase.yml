@@ -15,25 +15,31 @@
 # Reuses: load-recovery-key.yml, generate-passphrase.yml, tang-adv.yml,
 #         vault-recovery-key.yml.  Operates on the live crypt-* mappers.
 
-- name: "Rotate | derive disk set from live crypt-* mappers"
+- name: "Rotate | resolve the backing container of each open crypt-* mapper"
+  # State-aware and name-agnostic: rotate keyslots on the LUKS CONTAINER devices
+  # that are actually open, resolved from `cryptsetup status` — works whether the
+  # mappers are named crypt-<uuid> (persistent) or crypt-<device-node> (legacy,
+  # mid-migration). We must NOT strip the mapper name to a /dev/<node>: under
+  # crypt-<uuid> that yields a UUID, not a device.
   ansible.builtin.shell:
     cmd: |
       set -o pipefail
-      ls -1 /dev/mapper/ | grep '^crypt-' | sed 's/^crypt-//' | sort
+      for n in $(ls -1 /dev/mapper/ | grep '^crypt-' | sort); do
+        dev=$(cryptsetup status "$n" 2>/dev/null | awk '/^[[:space:]]*device:/{print $2; exit}')
+        [ -n "$dev" ] && printf '%s\n' "$dev"
+      done
     executable: /bin/bash
-  register: _rot_mappers
+  register: _rot_map
   changed_when: false
   check_mode: false
-  when: clevis_raw_disks is not defined
 
-- name: "Rotate | set clevis_raw_disks from live mappers"
+- name: "Rotate | the set of LUKS container devices to rotate"
   ansible.builtin.set_fact:
-    clevis_raw_disks: "{{ _rot_mappers.stdout_lines }}"
-  when: clevis_raw_disks is not defined
+    _rot_devs: "{{ _rot_map.stdout_lines | unique }}"
 
 - name: "Rotate | assert there are disks to rotate"
   ansible.builtin.assert:
-    that: clevis_raw_disks | length > 0
+    that: _rot_devs | length > 0
     fail_msg: "No open crypt-* mappers found — nothing to rotate."
 
 - name: "Rotate passphrase + re-bind clevis"
@@ -61,8 +67,8 @@
     # ── Phase A: add the new keyslot (authorised by the old key) ──────────
     - name: "Rotate | check whether the new key already opens each disk"
       ansible.builtin.command: >-
-        cryptsetup open --test-passphrase --key-file /tmp/ansible_luks_key_new /dev/{{ item }}
-      loop: "{{ clevis_raw_disks }}"
+        cryptsetup open --test-passphrase --key-file /tmp/ansible_luks_key_new {{ item }}
+      loop: "{{ _rot_devs }}"
       register: _rot_newtest
       changed_when: false
       failed_when: false
@@ -71,7 +77,7 @@
     - name: "Rotate | add the new keyslot on each disk"
       ansible.builtin.command: >-
         cryptsetup luksAddKey --key-file /tmp/ansible_luks_key_old
-        /dev/{{ item.item }} /tmp/ansible_luks_key_new
+        {{ item.item }} /tmp/ansible_luks_key_new
       loop: "{{ _rot_newtest.results }}"
       loop_control:
         label: "{{ item.item }}"
@@ -83,9 +89,9 @@
       ansible.builtin.shell:
         cmd: |
           set -o pipefail
-          clevis luks list -d /dev/{{ item }} | awk -F: '/sss|tang/{gsub(/ /,"",$1); print $1; exit}'
+          clevis luks list -d {{ item }} | awk -F: '/sss|tang/{gsub(/ /,"",$1); print $1; exit}'
         executable: /bin/bash
-      loop: "{{ clevis_raw_disks }}"
+      loop: "{{ _rot_devs }}"
       register: _rot_slots
       changed_when: false
       check_mode: false
@@ -94,7 +100,7 @@
 
     - name: "Rotate | regenerate clevis binding against current Tang advertisements"
       ansible.builtin.command: >-
-        clevis luks regen -q -d /dev/{{ item.item }} -s {{ item.stdout }}
+        clevis luks regen -q -d {{ item.item }} -s {{ item.stdout }}
       loop: "{{ _rot_slots.results }}"
       loop_control:
         label: "{{ item.item }} (slot {{ item.stdout | default('?') }})"
@@ -108,8 +114,8 @@
     # ── Verify gate: the new key MUST open every disk before removing old ─
     - name: "Rotate | VERIFY the new key opens every disk (gate before removal)"
       ansible.builtin.command: >-
-        cryptsetup open --test-passphrase --key-file /tmp/ansible_luks_key_new /dev/{{ item }}
-      loop: "{{ clevis_raw_disks }}"
+        cryptsetup open --test-passphrase --key-file /tmp/ansible_luks_key_new {{ item }}
+      loop: "{{ _rot_devs }}"
       changed_when: false
       check_mode: false
       # default failed_when (rc != 0) aborts the block before Phase C if any disk
@@ -118,8 +124,8 @@
     # ── Phase C: remove the old keyslot ──────────────────────────────────
     - name: "Rotate | check whether the old key still opens each disk"
       ansible.builtin.command: >-
-        cryptsetup open --test-passphrase --key-file /tmp/ansible_luks_key_old /dev/{{ item }}
-      loop: "{{ clevis_raw_disks }}"
+        cryptsetup open --test-passphrase --key-file /tmp/ansible_luks_key_old {{ item }}
+      loop: "{{ _rot_devs }}"
       register: _rot_oldtest
       changed_when: false
       failed_when: false
@@ -127,7 +133,7 @@
 
     - name: "Rotate | remove the old keyslot on each disk"
       ansible.builtin.command: >-
-        cryptsetup luksRemoveKey --key-file /tmp/ansible_luks_key_old /dev/{{ item.item }}
+        cryptsetup luksRemoveKey --key-file /tmp/ansible_luks_key_old {{ item.item }}
       loop: "{{ _rot_oldtest.results }}"
       loop_control:
         label: "{{ item.item }}"

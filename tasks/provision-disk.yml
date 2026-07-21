@@ -62,19 +62,29 @@
     CURL_HOME: "{{ clevis_curl_home }}"
 
 # ── Open, test Tang unlock, close ─────────────────────────────────────────────
+# The mapper is named crypt-<LUKS-UUID> (persistent), NOT crypt-<device-node>:
+# kernel node names are unstable across boots/controller flaps, whereas the LUKS
+# header UUID is immutable and readable from the device itself. Read it now (the
+# device is LUKS by this point — just formatted, or already was).
+
+- name: "Read the LUKS header UUID: {{ disk_device }}"
+  ansible.builtin.command: cryptsetup luksUUID "/dev/{{ disk_device }}"
+  register: _luks_uuid
+  changed_when: false
+  check_mode: false
 
 - name: "Open LUKS mapper with key file: {{ disk_device }}"
   ansible.builtin.command: >
     cryptsetup luksOpen --key-file /tmp/ansible_luks_key
-    "/dev/{{ disk_device }}" "crypt-{{ disk_device }}"
+    "/dev/{{ disk_device }}" "crypt-{{ _luks_uuid.stdout }}"
   args:
-    creates: "/dev/mapper/crypt-{{ disk_device }}"
+    creates: "/dev/mapper/crypt-{{ _luks_uuid.stdout }}"
 
 - name: "Close LUKS mapper to test Tang network unlock: {{ disk_device }}"
   ansible.builtin.shell:
     cmd: |
-      if [ -b "/dev/mapper/crypt-{{ disk_device }}" ]; then
-        cryptsetup luksClose "crypt-{{ disk_device }}"
+      if [ -b "/dev/mapper/crypt-{{ _luks_uuid.stdout }}" ]; then
+        cryptsetup luksClose "crypt-{{ _luks_uuid.stdout }}"
       fi
     executable: /bin/bash
   changed_when: false
@@ -83,7 +93,7 @@
 - name: "Verify Tang decryption succeeds (1-of-N SSS): {{ disk_device }}"
   # Deliberately omits --key-file to force the system to use the Clevis token.
   ansible.builtin.command: >
-    clevis luks unlock -d "/dev/{{ disk_device }}" -n "crypt-{{ disk_device }}"
+    clevis luks unlock -d "/dev/{{ disk_device }}" -n "crypt-{{ _luks_uuid.stdout }}"
   register: tang_verify
   until: tang_verify.rc == 0
   retries: 3

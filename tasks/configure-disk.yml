@@ -38,11 +38,13 @@
 - name: "Write /etc/crypttab entry for: {{ disk_device }}"
   ansible.builtin.lineinfile:
     path: /etc/crypttab
-    # regexp matches the mapper name at the start of the line so any existing
-    # entry for this device is replaced rather than duplicated.  Without this,
-    # re-running on a node with an older entry (different flags, old noauto style)
-    # would append a second line for the same device.
-    regexp: "^crypt-{{ disk_device }}\\s"
+    # Match on the LUKS UUID in the SOURCE column, not the mapper name, so this
+    # replaces whatever crypt-<name> line already exists for THIS volume — a
+    # legacy crypt-<device-node> line, or the crypt-<uuid> line itself — in place.
+    # No orphan, no duplicate; idempotent on re-apply. This is also the in-place
+    # migration of a legacy crypttab to persistent names (the old node-named line
+    # is rewritten to crypt-<uuid> the first time the role runs after the upgrade).
+    regexp: "^crypt-\\S+\\s+UUID={{ disk_uuid.stdout }}\\s"
     # Flags explained:
     #   _netdev       — tells systemd this unit needs network; places the unit in
     #                   remote-cryptsetup.target and adds After=network.target.
@@ -57,12 +59,20 @@
     #                   these disks in the booted system, after network-online.
     #   nofail        — boot continues even if unlock times out (tang offline).
     #   discard       — passes TRIM/discard through to the NVMe for wear-levelling.
-    line: "crypt-{{ disk_device }} UUID={{ disk_uuid.stdout }} none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target"
+    line: "crypt-{{ disk_uuid.stdout }} UUID={{ disk_uuid.stdout }} none luks,discard,noauto,nofail,_netdev,x-systemd.after=network-online.target"
     create: true
     mode: '0600'
     owner: root
     group: root
+  register: _crypttab_line
   notify: "Rebuild initramfs"
+
+# Signal the storage layer (consumer role) that a crypttab entry changed — i.e.
+# a mapper name was migrated — so it can decide whether a pool member needs
+# re-attaching. Accumulated across the per-disk loop (host-level boolean).
+- name: "Record whether crypttab changed for: {{ disk_device }}"
+  ansible.builtin.set_fact:
+    clevis_crypttab_changed: "{{ (clevis_crypttab_changed | default(false)) or (_crypttab_line is changed) }}"
 
 # ── Live discard passthrough ──────────────────────────────────────────────────
 # Persistence across reboots is handled by clevis-unlock-data opening the mapper
@@ -84,7 +94,7 @@
   # for the currently open mapper.  rc=0 means the device is active; non-zero
   # means it is not open (device absent or not yet unlocked).
   # check_mode: false — read-only probe, safe to run unconditionally.
-  ansible.builtin.command: cryptsetup status "crypt-{{ disk_device }}"
+  ansible.builtin.command: cryptsetup status "crypt-{{ disk_uuid.stdout }}"
   register: _mapper_status
   changed_when: false
   failed_when: false
@@ -112,7 +122,7 @@
   ansible.builtin.shell:
     cmd: |
       set -uo pipefail
-      NAME="crypt-{{ disk_device }}"
+      NAME="crypt-{{ disk_uuid.stdout }}"
       # Recover the Clevis passphrase from the disk that ACTUALLY backs this
       # mapper — NOT from /dev/{{ disk_device }}.  NVMe kernel names (nvmeXn1)
       # are assigned by controller probe order and are not stable across boots,

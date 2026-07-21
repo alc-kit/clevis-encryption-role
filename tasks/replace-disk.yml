@@ -14,8 +14,11 @@
 # Inputs (operator-supplied, no defaults):
 #   clevis_replace_new        new bare device name (e.g. nvme2n1)
 # Optional:
-#   clevis_replace_old_device old bare device name whose stale crypttab entry to
-#                             remove (e.g. nvme2n1); omit to leave crypttab as-is.
+#   clevis_replace_old_uuid   LUKS UUID of the REMOVED (dead) disk whose stale
+#                             crypttab entry to delete. The dead disk cannot be
+#                             probed, so its UUID must be supplied (read it from
+#                             the prior crypttab / crypttab-uuid-audit output).
+#                             Omit to leave crypttab as-is.
 
 - name: "Replace disk | validate inputs"
   ansible.builtin.assert:
@@ -42,28 +45,33 @@
       vars:
         disk_device: "{{ clevis_replace_new }}"
 
-    - name: "Replace disk | remove stale crypttab entry for the old device"
+    - name: "Replace disk | remove the dead disk's stale crypttab entry (by LUKS UUID)"
       ansible.builtin.lineinfile:
         path: /etc/crypttab
-        regexp: "^crypt-{{ clevis_replace_old_device }}\\s"
+        # The removed disk is gone and cannot be blkid'd; match its recorded LUKS
+        # UUID in the SOURCE column (name-agnostic — deletes a legacy crypt-<node>
+        # or a crypt-<uuid> line for that volume).
+        regexp: "^crypt-\\S+\\s+UUID={{ clevis_replace_old_uuid }}\\s"
         state: absent
       when:
-        - clevis_replace_old_device is defined
-        - (clevis_replace_old_device | string | length > 0)
-        - clevis_replace_old_device != clevis_replace_new
+        - clevis_replace_old_uuid is defined
+        - (clevis_replace_old_uuid | string | length > 0)
       notify: "Rebuild initramfs"
 
-    - name: "Replace disk | re-derive the live disk set from crypt-* mappers"
+    - name: "Replace disk | count the live crypt-* mappers (for the unlock timeout)"
+      # boot-ordering-dropins scales clevis-unlock-data's TimeoutStartSec by the
+      # disk count, so we only need the current set size. List the mapper names —
+      # no node-name derivation (crypt-<uuid> has no device node to strip to).
       ansible.builtin.shell:
         cmd: |
           set -o pipefail
-          ls -1 /dev/mapper/ | grep '^crypt-' | sed 's/^crypt-//' | sort
+          ls -1 /dev/mapper/ | grep '^crypt-' | sort
         executable: /bin/bash
       register: _rp_live_mappers
       changed_when: false
       check_mode: false
 
-    - name: "Replace disk | update clevis_raw_disks to the live mapper set"
+    - name: "Replace disk | set clevis_raw_disks to the live mapper set"
       ansible.builtin.set_fact:
         clevis_raw_disks: "{{ _rp_live_mappers.stdout_lines }}"
 

@@ -31,19 +31,22 @@
 - name: "Pre-flight: reset the crypttab pair accumulator"
   ansible.builtin.set_fact:
     clevis_crypttab_pairs: []
+    # Reset the migration signal too (configure-disk accumulates into it below).
+    clevis_crypttab_changed: false
 
 - name: "Pre-flight: build the (target, uuid, type) set to be written"
+  # The mapper name is crypt-<LUKS-UUID> (persistent), derived from the device's
+  # own LUKS header UUID — not the unstable kernel node name.
+  vars:
+    _u: "{{ item.stdout_lines | default([]) | select('match', '^UUID=') | map('regex_replace', '^UUID=', '') | first | default('') }}"
+    _t: "{{ item.stdout_lines | default([]) | select('match', '^TYPE=') | map('regex_replace', '^TYPE=', '') | first | default('') }}"
   ansible.builtin.set_fact:
     clevis_crypttab_pairs: >-
       {{ clevis_crypttab_pairs + [{
-           'name': 'crypt-' ~ item.item,
+           'name': 'crypt-' ~ _u,
            'dev': '/dev/' ~ item.item,
-           'uuid': (item.stdout_lines | default([])
-                    | select('match', '^UUID=') | map('regex_replace', '^UUID=', '')
-                    | first | default('')),
-           'type': (item.stdout_lines | default([])
-                    | select('match', '^TYPE=') | map('regex_replace', '^TYPE=', '')
-                    | first | default(''))
+           'uuid': _u,
+           'type': _t
          }] }}
   loop: "{{ _clevis_blkid.results }}"
   loop_control:
