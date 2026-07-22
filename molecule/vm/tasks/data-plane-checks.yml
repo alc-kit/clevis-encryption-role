@@ -1,0 +1,107 @@
+---
+# Reusable data-plane checks for the LUKS/Clevis mappers — the spec's check 3
+# (identity/status) and check 4 (nonce-based byte-exact round-trip + cross-wire).
+#
+# Included from BOTH converge.yml (pre-reboot, "check 3/4") and verify.yml
+# (post-reboot, "check 7 — repeat 3+4 after a real boot cycle"). The caller sets:
+#   _dp_map           list of {dev, uuid, mapper}, one per raw disk
+#   dp_phase          human label for reporting (e.g. "pre-reboot", "post-reboot")
+#   clevis_curl_home  CURL_HOME for the forced clevis unlock (IP-family pin)
+#   dp_seek           sector offset for the round-trip payload (default 2048)
+#
+# The mappers end this file OPEN (each read step re-derives the key via clevis
+# and leaves the mapper active).
+
+- name: "Check 3 — identity/status: mapper active + correct backing device ({{ dp_phase }})"
+  # cryptsetup status <mapper> must report the mapper active AND point at THIS
+  # device specifically (not just any device) — catches a mapper wired to the
+  # wrong backing disk.
+  ansible.builtin.command: "cryptsetup status {{ item.mapper }}"
+  loop: "{{ _dp_map }}"
+  register: _dp_status
+  changed_when: false
+  failed_when: >-
+    ('is active' not in _dp_status.stdout) or
+    ('/dev/' ~ item.dev not in _dp_status.stdout)
+  loop_control:
+    label: "{{ item.mapper }} <- /dev/{{ item.dev }}"
+
+# ── Check 4 — nonce-based, byte-exact round-trip + cross-wire detection ───────
+# ALL payloads are written FIRST, then ALL read back, so a cross-wired pair of
+# mappers (both pointing at the same backing device) is caught: the second write
+# clobbers the first, and the first mapper reads back the wrong payload.
+
+- name: "Check 4a — write a unique nonce to each mapper ({{ dp_phase }})"
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -euo pipefail
+      m="{{ item.mapper }}"
+      # Unique per host, per device, per run — no static strings.
+      payload="$(hostname)-${m}-{{ dp_seek }}-$(date +%s)-${RANDOM}${RANDOM}${RANDOM}"
+      [ "$(printf '%s' "$payload" | wc -c)" -lt 512 ] || { echo "payload >= 512 bytes" >&2; exit 1; }
+      # conv=sync NUL-pads the single block to a full 512-byte sector, so the
+      # read-back (| tr -d '\0') is byte-exact and robust across repeated runs.
+      printf '%s' "$payload" \
+        | dd of="/dev/mapper/${m}" bs=512 seek={{ dp_seek }} count=1 conv=sync,notrunc,fsync 2>/dev/null
+      printf '%s' "$payload"
+  loop: "{{ _dp_map }}"
+  register: _dp_payloads
+  changed_when: false
+  loop_control:
+    label: "{{ item.mapper }}"
+
+- name: "Check 4b — force luksClose + clevis unlock, then read the nonce back ({{ dp_phase }})"
+  # Re-derive the key from Tang rather than trusting the still-open mapping.
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -euo pipefail
+      d="/dev/{{ item.dev }}"
+      m="{{ item.mapper }}"
+      # Silence the setup commands: on a low-memory VM cryptsetup prints an
+      # Argon2 "requires more than available memory" warning that would otherwise
+      # pollute stdout. The read-back is captured in isolation so stdout is
+      # EXACTLY the payload bytes.
+      cryptsetup luksClose "$m" >/dev/null 2>&1
+      CURL_HOME="{{ clevis_curl_home }}" clevis luks unlock -d "$d" -n "$m" >/dev/null 2>&1
+      readback="$(dd if="/dev/mapper/${m}" bs=512 skip={{ dp_seek }} count=1 2>/dev/null | tr -d '\0')"
+      printf '%s' "$readback"
+  loop: "{{ _dp_map }}"
+  register: _dp_readbacks
+  changed_when: false
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  loop_control:
+    label: "{{ item.mapper }}"
+
+- name: "Check 4c — assert byte-exact round-trip per device ({{ dp_phase }})"
+  ansible.builtin.assert:
+    that:
+      - _dp_readbacks.results[item].stdout == _dp_payloads.results[item].stdout
+    fail_msg: >-
+      Round-trip MISMATCH on {{ _dp_map[item].mapper }} (/dev/{{ _dp_map[item].dev }}):
+      wrote '{{ _dp_payloads.results[item].stdout }}',
+      read '{{ _dp_readbacks.results[item].stdout }}'.
+    success_msg: >-
+      {{ _dp_map[item].mapper }}: byte-exact round-trip OK
+      ('{{ _dp_readbacks.results[item].stdout }}').
+  loop: "{{ range(0, _dp_map | length) | list }}"
+  loop_control:
+    label: "{{ _dp_map[item].mapper }}"
+
+- name: "Check 4d — assert no cross-wiring (read-back belongs only to its own device) ({{ dp_phase }})"
+  vars:
+    _own: "{{ _dp_payloads.results[item].stdout }}"
+    _others: >-
+      {{ _dp_payloads.results | map(attribute='stdout') | list | difference([_own]) }}
+  ansible.builtin.assert:
+    that:
+      - _dp_readbacks.results[item].stdout not in _others
+    fail_msg: >-
+      CROSS-WIRE detected: {{ _dp_map[item].mapper }} read back a payload that
+      belongs to a different device — its backing disk mapping is wrong.
+    success_msg: "{{ _dp_map[item].mapper }}: no cross-wire (payload unique to this device)."
+  loop: "{{ range(0, _dp_map | length) | list }}"
+  loop_control:
+    label: "{{ _dp_map[item].mapper }}"

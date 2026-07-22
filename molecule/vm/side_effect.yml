@@ -1,9 +1,10 @@
 ---
-# The heart of the Tier-2 test: REBOOT the encrypted host so the boot chain runs
-# for real.  Only after a reboot do the data disks get unlocked at boot by
-# clevis-unlock-data from the EXTERNAL Tang over the network, the decoupled
-# import chain fire, and allow_discards prove durable — none of which the
-# provisioning run (converge) exercises.  verify.yml asserts the post-reboot state.
+# The heart of the vm test: REBOOT the encrypted host so the boot chain runs for
+# real.  Only after a reboot do the data disks get unlocked at boot by
+# clevis-unlock-data from the EXTERNAL Tang over the network, the downstream unit
+# fire ordered after the unlock seam, and allow_discards prove durable — none of
+# which the provisioning run (converge) exercises.  verify.yml asserts the
+# post-reboot state.
 - name: "Reboot the encrypted host to exercise the real boot chain"
   hosts: clevis-target
   become: true
@@ -14,12 +15,13 @@
       ansible.builtin.reboot:
         reboot_timeout: 600
 
-    - name: "Wait for the boot chain to settle (encrypted-storage-ready.target)"  # noqa: command-instead-of-module
-      # sshd returns at multi-user.target, but the unlock -> import -> pool-check
-      # -> ready.target chain is network-ordered with retry delays, so it can
-      # still be running when SSH is back.  Wait for the barrier before verify
-      # asserts (active = done; otherwise verify reports the real failure).
-      ansible.builtin.command: systemctl is-active encrypted-storage-ready.target
+    - name: "Wait for the downstream fan-in to settle"  # noqa: command-instead-of-module
+      # sshd returns at multi-user.target, but the network-ordered unlock ->
+      # clevis-luks-unlocked.target -> downstream-test.service chain has retry
+      # delays, so it can still be running when SSH is back.  Wait for the end of
+      # the synthetic chain before verify asserts (active = done; otherwise verify
+      # reports the real failure).
+      ansible.builtin.command: systemctl is-active downstream-test.service
       register: _ready
       until: _ready.stdout == "active"
       retries: 40

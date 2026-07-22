@@ -5,8 +5,8 @@
 # not every push.  GitHub-hosted ubuntu-latest exposes /dev/kvm.
 #
 # NOTE: this bootstrap is PROVEN on GitHub-hosted ubuntu-latest — both matrix
-# jobs pass with nested KVM (Tier-1 `default` ~4 min, Tier-2 `vm` ~11 min: 2 VMs,
-# ZFS-on-LUKS, reboot).  It still cannot be exercised by `act` locally (act
+# jobs pass with nested KVM (Tier-1 `default` ~4 min, `vm` ~11 min: 2 VMs, NBDE
+# boot chain + reboot).  It still cannot be exercised by `act` locally (act
 # containers have no nested KVM/libvirtd), so validate changes here via a real
 # PR run or `workflow_dispatch`, not `act`.
 name: vm-tests
@@ -44,7 +44,7 @@ jobs:
       matrix:
         include:
           - scenario: default   # Tier-1: LUKS keyslot on a real virtio disk
-          - scenario: vm        # Tier-2: boot ordering, 2 VMs, ZFS-on-LUKS, reboot
+          - scenario: vm        # boot ordering + 7 LUKS/Clevis checks, 2 VMs, reboot
     steps:
       - uses: actions/checkout@v7
 
@@ -91,11 +91,6 @@ jobs:
           python -m pip install --upgrade \
             molecule 'molecule-plugins[vagrant]' python-vagrant ansible
           ansible-galaxy collection install ansible.posix community.general
-
-      - name: Install the encrypted_storage_pool consumer (for the vm scenario)
-        # The vm Tier-2 composes encrypted_storage_pool (btrfs) as the downstream
-        # consumer. Harmless for the default scenario (which doesn't use it).
-        run: ansible-galaxy role install -r molecule/vm/requirements.yml -p molecule/vm/roles
 
       - name: "molecule test -s ${{ matrix.scenario }}"
         env:

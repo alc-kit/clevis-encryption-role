@@ -1,16 +1,131 @@
 ---
-# Provision the encrypted host with the SPLIT stack: clevis_encryption unlocks
-# (NBDE-only, per host_vars) and encrypted_storage_pool assembles a btrfs pool
-# across the clevis-luks-unlocked.target seam. The provisioning block runs because
-# prepare.yml removed the controller-side recovery-key file (the gate).
+# Provision the encrypted host with clevis_encryption (NBDE-only) and validate the
+# LUKS/Clevis data plane BEFORE the reboot (spec checks 1–5). The provisioning
+# block runs because prepare.yml removed the controller-side recovery-key file
+# (the gate).
 #
-# This validates clevis's OWN bring-up against a real downstream consumer without
-# any ZFS/DKMS in clevis. Only the target is converged; the Tang VM is infra.
-- name: "Converge — clevis NBDE unlock + encrypted_storage_pool (btrfs)"
+# A SYNTHETIC downstream consumer unit is installed here (not the real
+# encrypted_storage_pool role): a oneshot ordered After=/Requires=
+# clevis-luks-unlocked.target that touches /run/downstream-test-ran at boot. That
+# lets the vm scenario prove clevis's OWN fan-in ordering contract (spec check 6)
+# without pulling a filesystem/pool consumer into the test — pool/RAID/ZFS
+# assembly is explicitly out of scope for this role's suite.
+- name: "Converge — clevis NBDE unlock + data-plane checks (1–5)"
   hosts: clevis-target
   become: true
   gather_facts: true
+  vars:
+    # CURL_HOME for the forced `clevis luks unlock` in checks 2/4 (matches the
+    # role default so the unlock uses the same curl IP-family pin as production).
+    clevis_curl_home: /etc/clevis/curl
 
   roles:
     - clevis_encryption
-    - encrypted_storage_pool
+
+  tasks:
+    # ── Synthetic downstream consumer for the reboot fan-in check (spec 6) ─────
+    - name: "Install synthetic downstream oneshot (fans in on the clevis unlock seam)"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/downstream-test.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Test-only: verifies clevis's unlock fan-in ordering across a real boot.
+          [Unit]
+          Description=Synthetic downstream consumer (clevis unlock fan-in ordering test)
+          # The role exposes a SINGLE fan-in seam (clevis-luks-unlocked.target) that
+          # requires clevis-unlock-data.service, which unlocks ALL N data disks — so
+          # requiring the target covers all N crypt-unlock units.
+          Requires=clevis-luks-unlocked.target
+          After=clevis-luks-unlocked.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/bin/touch /run/downstream-test-ran
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: "Enable the synthetic downstream unit (pulled in at boot)"
+      ansible.builtin.systemd_service:
+        name: downstream-test.service
+        enabled: true
+        daemon_reload: true
+
+    # ── Resolve device -> crypt-<uuid> mappers ─────────────────────────────────
+    - name: "Resolve mappers"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/resolve-mappers.yml"
+
+    # ── Check 1 — LUKS structural (LUKS2 + cipher + key size) ──────────────────
+    - name: "Check 1 — LUKS2 format + expected cipher/key size (cryptsetup defaults)"
+      # The role calls `cryptsetup luksFormat` with no explicit cipher/key size, so
+      # the effective defaults are cryptsetup's: aes-xts-plain64 / 512-bit key.
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -euo pipefail
+          d="/dev/{{ item.dev }}"
+          ver="$(cryptsetup luksDump "$d" | awk '/^Version:/{print $2; exit}')"
+          cipher="$(cryptsetup luksDump "$d" | awk '/[Cc]ipher:/{print $2; exit}')"
+          keybits="$(cryptsetup luksDump "$d" | awk '/Cipher key:/{print $3; exit}')"
+          echo "version=$ver cipher=$cipher keybits=$keybits"
+          [ "$ver" = "2" ]
+          [ "$cipher" = "aes-xts-plain64" ]
+          [ "$keybits" = "512" ]
+      loop: "{{ _dp_map }}"
+      register: _c1
+      changed_when: false
+      loop_control:
+        label: "/dev/{{ item.dev }}"
+
+    # ── Check 2 — Clevis/Tang binding, forced (not the still-open mapping) ─────
+    - name: "Check 2 — forced luksClose + clevis luks unlock succeeds (NBDE binding)"
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -euo pipefail
+          d="/dev/{{ item.dev }}"
+          m="{{ item.mapper }}"
+          if [ -b "/dev/mapper/$m" ]; then cryptsetup luksClose "$m"; fi
+          CURL_HOME="{{ clevis_curl_home }}" clevis luks unlock -d "$d" -n "$m"
+      loop: "{{ _dp_map }}"
+      changed_when: false
+      environment:
+        PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      loop_control:
+        label: "{{ item.mapper }}"
+
+    # ── Checks 3 + 4 — identity/status + byte-exact round-trip + cross-wire ────
+    - name: "Checks 3+4 — data-plane (pre-reboot)"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/data-plane-checks.yml"
+      vars:
+        dp_phase: "pre-reboot"
+        dp_seek: 2048
+
+    # ── Check 5 — last-sector boundary (off-by-one device-size reporting) ──────
+    - name: "Check 5 — write/read a nonce at the LAST sector, byte-exact"
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -euo pipefail
+          d="/dev/{{ item.dev }}"
+          m="{{ item.mapper }}"
+          sz="$(blockdev --getsz "/dev/mapper/${m}")"
+          last=$((sz - 1))
+          payload="$(hostname)-${m}-last-$(date +%s)-${RANDOM}${RANDOM}"
+          [ "$(printf '%s' "$payload" | wc -c)" -lt 512 ] || { echo "payload >= 512 bytes" >&2; exit 1; }
+          printf '%s' "$payload" \
+            | dd of="/dev/mapper/${m}" bs=512 seek="$last" count=1 conv=sync,notrunc,fsync 2>/dev/null
+          cryptsetup luksClose "$m"
+          CURL_HOME="{{ clevis_curl_home }}" clevis luks unlock -d "$d" -n "$m"
+          readback="$(dd if="/dev/mapper/${m}" bs=512 skip="$last" count=1 2>/dev/null | tr -d '\0')"
+          echo "sz=$sz last=$last payload=$payload readback=$readback"
+          [ "$payload" = "$readback" ]
+      loop: "{{ _dp_map }}"
+      changed_when: false
+      environment:
+        PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      loop_control:
+        label: "{{ item.mapper }}"

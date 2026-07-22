@@ -1,0 +1,24 @@
+---
+# Build _dp_map: one {dev, uuid, mapper} entry per raw disk, deriving the
+# persistent mapper name crypt-<LUKS-UUID> from the device itself (the role's
+# naming convention — never assumed, always read back via luksUUID).
+#
+# Caller provides clevis_raw_disks (the role's raw-device list).
+
+- name: "Resolve the LUKS header UUID of each raw disk"
+  ansible.builtin.command: "cryptsetup luksUUID /dev/{{ item }}"
+  loop: "{{ clevis_raw_disks }}"
+  register: _luks_uuids
+  changed_when: false
+
+- name: "Build the device -> crypt-<uuid> mapper map"
+  ansible.builtin.set_fact:
+    _dp_map: >-
+      {{ _dp_map | default([]) + [{
+           'dev': item.item,
+           'uuid': item.stdout,
+           'mapper': 'crypt-' ~ item.stdout
+         }] }}
+  loop: "{{ _luks_uuids.results }}"
+  loop_control:
+    label: "/dev/{{ item.item }} -> crypt-{{ item.stdout }}"

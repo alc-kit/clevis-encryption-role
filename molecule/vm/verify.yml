@@ -1,25 +1,21 @@
 ---
-# Post-REBOOT assertions for the Tier-2 VM test. These observe the REAL boot chain
-# (boot 2): clevis unlocked the disks at boot from the EXTERNAL Tang, reached
-# clevis-luks-unlocked.target, and the downstream consumer (encrypted_storage_pool,
-# btrfs) assembled + mounted the pool across the seam, surviving the reboot.
+# Post-REBOOT assertions (boot 2). clevis unlocked the data disks at boot from the
+# EXTERNAL Tang over the network, reached clevis-luks-unlocked.target, and the
+# synthetic downstream oneshot fired ordered after that seam. This proves clevis's
+# real boot chain WITHOUT any filesystem/pool/ZFS consumer in the loop.
 #
-# This proves clevis's bring-up WITHOUT any ZFS in clevis — the replacement for the
-# old ZFS-based Tier-2.
-- name: "Verify boot-time clevis/Tang unlock + downstream assembly (post-reboot)"
+# Spec mapping: check 6 (reboot fan-in ordering) + check 7 (post-reboot data-plane
+# re-verification = repeat checks 3+4 after a genuine boot cycle). Checks 1–5 ran
+# pre-reboot in converge.yml.
+- name: "Verify boot-time clevis/Tang unlock + fan-in ordering (post-reboot)"
   hosts: clevis-target
   become: true
   gather_facts: false
   vars:
-    esp_mnt: "/srv/data"
+    clevis_curl_home: /etc/clevis/curl
 
   tasks:
-    - name: "Assert encrypted-storage-ready.target reached (the boot barrier)"  # noqa: command-instead-of-module
-      ansible.builtin.command: systemctl is-active encrypted-storage-ready.target
-      register: _ready
-      changed_when: false
-      failed_when: _ready.stdout != "active"
-
+    # ── The clevis unlock seam reached this boot ───────────────────────────────
     - name: "Assert clevis-luks-unlocked.target is active (public NBDE seam)"  # noqa: command-instead-of-module
       ansible.builtin.command: systemctl is-active clevis-luks-unlocked.target
       register: _unlocked
@@ -39,98 +35,94 @@
           this boot. Journal was: {{ _unlocked_journal.stdout }}
         success_msg: "systemd reached clevis-luks-unlocked.target this boot."
 
-    - name: "Read boot-activation timestamps for the cross-role ordering chain"  # noqa: command-instead-of-module
-      ansible.builtin.command: >-
-        systemctl show -p ActiveEnterTimestampMonotonic --value {{ item }}
-      loop:
-        - clevis-unlock-data.service
-        - clevis-luks-unlocked.target
-        - encrypted-storage-assemble.service
-      register: _seam_ts
-      changed_when: false
-      loop_control:
-        label: "{{ item }}"
-
-    - name: "Assert the seam ORDERING held at boot (unlock-data <= target <= assemble)"
-      # Proves clevis's After= seam took effect across roles: the target was reached
-      # after clevis's unlock ran, and the consumer ran after the target.
-      vars:
-        _u: "{{ _seam_ts.results[0].stdout | int }}"
-        _t: "{{ _seam_ts.results[1].stdout | int }}"
-        _a: "{{ _seam_ts.results[2].stdout | int }}"
-      ansible.builtin.assert:
-        that:
-          - (_u | int) > 0
-          - (_t | int) > 0
-          - (_a | int) > 0
-          - (_u | int) <= (_t | int)
-          - (_t | int) <= (_a | int)
-        fail_msg: >-
-          Seam ordering broken (ActiveEnterTimestampMonotonic µs):
-          clevis-unlock-data={{ _u }}, clevis-luks-unlocked.target={{ _t }},
-          encrypted-storage-assemble={{ _a }} — expected all >0 and non-decreasing.
-        success_msg: >-
-          Seam ordering OK: unlock-data({{ _u }}) <= unlocked.target({{ _t }})
-          <= assemble({{ _a }}) µs.
-
-    - name: "Assert unlock + assemble + check services all succeeded"  # noqa: command-instead-of-module
-      ansible.builtin.command: "systemctl is-active {{ item }}"
-      loop:
-        - clevis-unlock-data.service
-        - encrypted-storage-assemble.service
-        - encrypted-storage-check.service
-      register: _svc
-      changed_when: false
-      failed_when: _svc.stdout != "active"
-      loop_control:
-        label: "{{ item }}"
-
-    - name: "Resolve the data mappers' persistent names (crypt-<uuid>)"
-      ansible.builtin.command: "cryptsetup luksUUID /dev/{{ item }}"
-      loop: [vdb, vdc]
-      register: _data_uuids
-      changed_when: false
-
-    - name: "Assert both data mappers are open after boot"
-      ansible.builtin.command: "cryptsetup status crypt-{{ item.stdout }}"
-      loop: "{{ _data_uuids.results }}"
-      changed_when: false
-      loop_control:
-        label: "crypt-{{ item.stdout }}"
-
-    - name: "Assert allow_discards is durable across the reboot on each mapper"
-      ansible.builtin.command: "dmsetup table crypt-{{ item.stdout }}"
-      loop: "{{ _data_uuids.results }}"
-      register: _dm
-      changed_when: false
-      failed_when: "'allow_discards' not in _dm.stdout"
-      loop_control:
-        label: "crypt-{{ item.stdout }}"
-
-    - name: "Assert the pool is mounted at {{ esp_mnt }}"
-      ansible.builtin.command: "mountpoint -q {{ esp_mnt }}"
-      changed_when: false
-
-    - name: "Assert real I/O on the pool survives the reboot (write + read back)"
-      ansible.builtin.shell:
-        cmd: |
-          f="{{ esp_mnt }}/.clevis-verify"
-          echo clevis-verified > "$f"
-          test "$(cat "$f")" = clevis-verified
-          rm -f "$f"
-        executable: /bin/bash
-      changed_when: false
-
-    - name: "Assert the boot unlock happened (clevis-unlock-data unlocked the disks)"
+    - name: "Assert the boot unlock ran (clevis-unlock-data unlocked the disks)"  # noqa: command-instead-of-module
       ansible.builtin.command: journalctl -b -u clevis-unlock-data.service --no-pager
       register: _journal
       changed_when: false
       failed_when: "'unlocked' not in _journal.stdout"
 
+    - name: "Assert clevis-unlock-data.service succeeded"  # noqa: command-instead-of-module
+      ansible.builtin.command: systemctl is-active clevis-unlock-data.service
+      register: _svc
+      changed_when: false
+      failed_when: _svc.stdout != "active"
+
+    # ── Check 6 — reboot fan-in ordering ───────────────────────────────────────
+    - name: "Check 6 — the synthetic downstream unit ran this boot"
+      ansible.builtin.stat:
+        path: /run/downstream-test-ran
+      register: _downstream
+
+    - name: "Check 6 — assert /run/downstream-test-ran exists (ordered after clevis unlock)"
+      ansible.builtin.assert:
+        that: _downstream.stat.exists
+        fail_msg: >-
+          /run/downstream-test-ran is MISSING — the downstream unit that
+          Requires=/After= clevis-luks-unlocked.target did not run this boot,
+          so the fan-in ordering contract is broken.
+        success_msg: "Downstream oneshot ran this boot (fan-in ordering held)."
+
+    - name: "Check 6 — read boot-activation timestamps for the ordering chain"  # noqa: command-instead-of-module
+      ansible.builtin.command: >-
+        systemctl show -p ActiveEnterTimestampMonotonic --value {{ item }}
+      loop:
+        - clevis-unlock-data.service
+        - clevis-luks-unlocked.target
+        - downstream-test.service
+      register: _seam_ts
+      changed_when: false
+      loop_control:
+        label: "{{ item }}"
+
+    - name: "Check 6 — assert the ordering held (unlock-data <= target <= downstream)"
+      vars:
+        _u: "{{ _seam_ts.results[0].stdout | int }}"
+        _t: "{{ _seam_ts.results[1].stdout | int }}"
+        _d: "{{ _seam_ts.results[2].stdout | int }}"
+      ansible.builtin.assert:
+        that:
+          - (_u | int) > 0
+          - (_t | int) > 0
+          - (_d | int) > 0
+          - (_u | int) <= (_t | int)
+          - (_t | int) <= (_d | int)
+        fail_msg: >-
+          Seam ordering broken (ActiveEnterTimestampMonotonic µs):
+          clevis-unlock-data={{ _u }}, clevis-luks-unlocked.target={{ _t }},
+          downstream-test={{ _d }} — expected all >0 and non-decreasing.
+        success_msg: >-
+          Seam ordering OK: unlock-data({{ _u }}) <= unlocked.target({{ _t }})
+          <= downstream({{ _d }}) µs.
+
+    # ── allow_discards durability across the reboot (bonus, clevis-owned) ──────
+    - name: "Resolve mappers (post-reboot)"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/resolve-mappers.yml"
+
+    - name: "Assert allow_discards is durable across the reboot on each mapper"
+      ansible.builtin.command: "dmsetup table {{ item.mapper }}"
+      loop: "{{ _dp_map }}"
+      register: _dm
+      changed_when: false
+      failed_when: "'allow_discards' not in _dm.stdout"
+      loop_control:
+        label: "{{ item.mapper }}"
+
+    # ── Check 7 — post-reboot data-plane re-verification (repeat checks 3+4) ───
+    # Independent of check 6: proves the device is actually USABLE after a real
+    # boot cycle, not merely that systemd ordering was satisfied. Runs LAST because
+    # it forces luksClose + clevis unlock (which would drop allow_discards asserted
+    # above; the boot-opened mapping keeps it).
+    - name: "Checks 3+4 re-run — data-plane (post-reboot)"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/data-plane-checks.yml"
+      vars:
+        dp_phase: "post-reboot"
+        dp_seek: 2048
+
     - name: "PASS"
       ansible.builtin.debug:
         msg: >-
-          Tier-2 PASSED — clevis unlocked both disks at boot from the external Tang,
-          clevis-luks-unlocked.target reached, encrypted_storage_pool (btrfs) mounted
-          {{ esp_mnt }} across the seam, real I/O round-trips, allow_discards durable
-          across the reboot, encrypted-storage-ready.target active. No ZFS in clevis.
+          vm scenario PASSED — clevis unlocked both disks at boot from the external
+          Tang, clevis-luks-unlocked.target reached, the synthetic downstream unit
+          fired in order (check 6), allow_discards durable across the reboot, and
+          the LUKS data plane round-trips byte-exact post-reboot (check 7). No
+          filesystem/pool consumer involved.

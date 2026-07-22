@@ -1,15 +1,12 @@
 ---
-# Tier-2 (VM) preparation, in two parts:
+# VM scenario preparation, in two parts:
 #   1. clevis-tang   : stand up the EXTERNAL Tang server on the NAT network.
 #   2. controller    : generate a throwaway vault password and REMOVE any stale
 #                      recovery key so the role's provisioning block runs fresh.
 #
-# NOTE: no ZFS/DKMS platform prep any more. clevis runs NBDE-only; the downstream
-# consumer (encrypted_storage_pool, btrfs) installs its own mainline userland
-# (btrfs-progs) — no out-of-tree module, no kernel headers, no contrib.
-#
-# clevis_encryption (NBDE) + encrypted_storage_pool (btrfs) are applied by
-# converge.yml — that is the thing under test, exercised for real and across a reboot.
+# NOTE: no ZFS/DKMS and no pool consumer prep. clevis runs NBDE-only; converge.yml
+# applies clevis_encryption + installs a synthetic downstream oneshot, and is the
+# thing under test — exercised for real and across a reboot.
 
 # ── 1. External Tang server ──────────────────────────────────────────────────
 - name: "Prepare the external Tang server"
