@@ -1,0 +1,58 @@
+---
+# Drives the REAL provisioning-gate logic — tasks/assess-disks-classify.yml and
+# tasks/assert-provisioned.yml — against synthetic probe output. No block
+# devices, no root, no gathered facts; runs on any CI runner.
+#
+# Each fixture supplies the probe's stdout_lines plus the classification and
+# post-condition outcome it must produce. The assert below is what fails the
+# playbook, so a non-zero exit means the gate logic changed behaviour.
+- name: "Provisioning-gate fixture"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    clevis_raw_disks: "{{ fixture_disks | default([]) }}"
+  tasks:
+    - name: "Inject the synthetic probe result"
+      ansible.builtin.set_fact:
+        clevis_disk_assessment:
+          stdout_lines: "{{ fixture_stdout_lines }}"
+
+    - name: "Run the REAL classification"
+      ansible.builtin.include_tasks: ../../tasks/assess-disks-classify.yml
+
+    - name: "Classification must match the fixture"
+      ansible.builtin.assert:
+        that:
+          - (clevis_assessment_complete | bool) == (expect_complete | bool)
+          - (clevis_provisioning_needed | bool) == (expect_needed | bool)
+          - (clevis_disks_needing_work | length) == (expect_work_count | int)
+        fail_msg: >-
+          {{ fixture_name }}: classification mismatch —
+          complete={{ clevis_assessment_complete | default('?') }} (want {{ expect_complete }}),
+          needed={{ clevis_provisioning_needed | default('?') }} (want {{ expect_needed }}),
+          work={{ clevis_disks_needing_work | default([]) | length }} (want {{ expect_work_count }}).
+        quiet: true
+
+    # The post-condition is SUPPOSED to fail for most of these fixtures, so run
+    # it under rescue and compare the outcome to what the fixture expects. This
+    # is the negative control: a guard that cannot fail is worse than none.
+    - name: "Run the REAL post-condition and record whether it fired"
+      block:
+        - name: "Post-condition"
+          ansible.builtin.include_tasks: ../../tasks/assert-provisioned.yml
+        - name: "It passed"
+          ansible.builtin.set_fact:
+            gate_assert_outcome: pass
+      rescue:
+        - name: "It failed"
+          ansible.builtin.set_fact:
+            gate_assert_outcome: fail
+
+    - name: "Post-condition outcome must match the fixture"
+      ansible.builtin.assert:
+        that: gate_assert_outcome == expect_assert
+        fail_msg: >-
+          {{ fixture_name }}: post-condition {{ gate_assert_outcome }}ed,
+          but the fixture expects it to {{ expect_assert }}.
+        success_msg: "{{ fixture_name }}: {{ expect_assert }} (as expected)"

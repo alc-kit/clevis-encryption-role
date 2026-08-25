@@ -60,7 +60,10 @@
     # These tasks always run.  They establish the facts needed by both the
     # provisioning and boot-ordering blocks.
 
-    - name: "Check whether recovery key already exists on controller"
+    # NOT a gate any more — see the PROVISIONING block below. This only decides
+    # whether the DR key is REUSED (it exists: the only key that can open headers
+    # a previous run already wrote) or generated fresh (it does not).
+    - name: "Check whether a vaulted DR recovery key exists on the controller"
       ansible.builtin.stat:
         path: "{{ clevis_recovery_key_path }}"
       register: clevis_recovery_key_stat
@@ -83,24 +86,65 @@
       when: clevis_raw_disks is not defined
       tags: always
 
+    # What do the disks ACTUALLY carry? This replaces the controller-side file
+    # test as the provisioning gate — see tasks/assess-disks.yml for why.
+    - name: "Assess what the data disks already carry"
+      ansible.builtin.include_tasks: assess-disks.yml
+      tags: [provision]
+
+    # Provisioned disks with no vaulted key means the DR key is GONE. The role
+    # cannot regenerate it — the passphrase exists only inside the LUKS headers,
+    # and Tang unlock does not reveal it. Nothing here can fix that, so warn
+    # rather than fail: the node still boots, but it has no break-glass path.
+    - name: "WARNING: disks are provisioned but the controller holds no DR recovery key"
+      ansible.builtin.debug:
+        msg: >-
+          *** {{ inventory_hostname }}: every data disk is LUKS2-formatted and
+          Tang-bound, but no vaulted recovery key exists at
+          {{ clevis_recovery_key_path }}. This node has NO break-glass unlock if
+          Tang becomes unreachable. The passphrase cannot be recovered from the
+          header — rotate it (tasks/rotate-passphrase.yml) to establish a new
+          vaulted key while the disks are still open. ***
+      when:
+        - not (clevis_provisioning_needed | default(false) | bool)
+        - not clevis_recovery_key_stat.stat.exists
+      tags: [provision]
+
     # ── BLOCK: PROVISIONING ─────────────────────────────────────────────────
-    # Skipped entirely when the recovery key vault file already exists on the
-    # controller — that file is created at the end of a successful first run,
-    # so its presence means the node was already provisioned.
+    # Gated on the HOST's real state (any disk not LUKS2, or LUKS2 but unbound),
+    # never on a controller-side artefact. A run that died midway is therefore
+    # RESUMABLE: it reuses the vaulted key — the only key that opens the headers
+    # the previous attempt wrote — and finishes the disks it never reached.
+    #
+    # The per-disk guards in provision-disk.yml (cryptsetup isLuks, clevis luks
+    # list) already make every step idempotent, so this gate exists to avoid
+    # needless work and key exposure, NOT for safety. Safety comes from the
+    # post-condition assert below, which runs whether or not this block did.
     #
     # The always: section guarantees the temporary key is removed from the
     # remote host even if any provisioning task fails midway.
 
     - name: "Provision disk encryption"
-      when: not clevis_recovery_key_stat.stat.exists
+      when: clevis_provisioning_needed | default(false) | bool
       tags: [provision]
       block:
 
         # --- Recovery key -------------------------------------------------------
+        # REUSE beats regenerate. A fresh passphrase cannot open a header a
+        # previous run already wrote, so on a resumed run the vaulted key is the
+        # only workable one; `clevis luks bind` would fail with "No key available
+        # with this passphrase". Reuse is also harmless on a fresh disk, where it
+        # simply becomes that disk's passphrase — so the rule is unconditional
+        # and needs no cleverness: exists -> load, absent -> generate.
+        - name: "Reuse the existing vaulted DR recovery key"
+          ansible.builtin.include_tasks: load-recovery-key.yml
+          when: clevis_recovery_key_stat.stat.exists
+
         # Generates the DR passphrase (sets clevis_passphrase) and stores it as
         # the vault-encrypted recovery key on the controller.
-        - name: "Generate and vault the DR recovery key"
+        - name: "Generate and vault a new DR recovery key"
           ansible.builtin.include_tasks: generate-recovery-key.yml
+          when: not clevis_recovery_key_stat.stat.exists
 
         # Network preconditions for Tang (DNS + the clevis curl IP-family pin)
         # are handled by tasks/prestage.yml above — runs unconditionally on every
@@ -112,6 +156,9 @@
           ansible.builtin.include_tasks: tang-adv.yml
 
         # --- Disk provisioning ------------------------------------------------
+        # Only on the generate path: load-recovery-key.yml has already written
+        # /tmp/ansible_luks_key on the remote host, and clevis_passphrase is not
+        # set there — templating it here would truncate the key to an empty file.
         - name: "Write temporary key file to remote host"
           ansible.builtin.copy:
             dest: /tmp/ansible_luks_key
@@ -119,6 +166,8 @@
             owner: root
             group: root
             mode: '0600'
+          when: not clevis_recovery_key_stat.stat.exists
+          no_log: true
 
         - name: "Provision encryption on each data disk"
           ansible.builtin.include_tasks: provision-disk.yml
@@ -137,6 +186,24 @@
             path: /tmp/ansible_luks_key
             state: absent
           when: not (clevis_keep_temp_key | default(false) | bool)
+
+    # ── POST-CONDITION ──────────────────────────────────────────────────────
+    # UNCONDITIONAL — it runs whether the block above provisioned, was skipped,
+    # or was skipped for the WRONG REASON. That last case is the whole point.
+    # Every incident this role has caused shares one shape: a guard meant to make
+    # a destructive step safe instead made it silently do nothing, and the run
+    # failed later somewhere unrelated. A skip is not evidence of a good state;
+    # only re-reading the disks is.
+    #
+    # Fails CLOSED: if the assessment did not run, or its facts are missing, the
+    # defaults below are the failing values, not the passing ones.
+    - name: "Re-read the disks after provisioning"
+      ansible.builtin.include_tasks: assess-disks.yml
+      tags: [provision]
+
+    - name: "POST-CONDITION: prove the end state on disk"
+      ansible.builtin.include_tasks: assert-provisioned.yml
+      tags: [provision]
 
     # ── BLOCK: BOOT ORDERING ────────────────────────────────────────────────
     # Always runs — idempotent and safe on already-encrypted live systems.

@@ -122,10 +122,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: shellcheck the audit script and test harnesses
-        run: shellcheck files/crypttab-uuid-audit.sh tests/crypttab-guard/run.sh tests/discovery/run.sh
+        run: shellcheck files/crypttab-uuid-audit.sh tests/crypttab-guard/run.sh tests/discovery/run.sh tests/provisioning-gate/run.sh
 
       - name: Run the crypttab UUID-collision regression tests
         run: tests/crypttab-guard/run.sh
 
       - name: Run the disk-discovery selection tests
         run: tests/discovery/run.sh
+
+      # The provisioning gate replaced a controller-side file test that made a
+      # resumed run silently do nothing. These fixtures prove the replacement
+      # FAILS on bad input, including the case that motivated the sentinel: an
+      # empty probe result must never read as "every disk is provisioned".
+      - name: Run the provisioning-gate regression tests
+        run: tests/provisioning-gate/run.sh

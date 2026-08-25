@@ -1,0 +1,3 @@
+{"fixture_name":"partial-run-unbound","fixture_disks":["nvme0n1","nvme1n1"],
+ "fixture_stdout_lines":["nvme1n1:needs-bind","ASSESSED"],
+ "expect_complete":true,"expect_needed":true,"expect_work_count":1,"expect_assert":"fail"}
