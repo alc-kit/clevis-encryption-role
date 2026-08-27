@@ -1,0 +1,27 @@
+---
+# The unconditional post-condition for disk provisioning. Lives in its own file
+# so tests/provisioning-gate drives the REAL assertion, not a copy of it.
+# See tasks/main.yml for why it must run even when provisioning was skipped.
+
+- name: "POST-CONDITION: every data disk is LUKS2-formatted and Tang-bound"
+  ansible.builtin.assert:
+    that:
+      - clevis_assessment_complete | default(false) | bool
+      - (clevis_disks_needing_work | default(['UNASSESSED'])) | length == 0
+    # NB both fail_msg AND success_msg are templated BEFORE the task runs, so
+    # every variable here is read through a default — a bare reference would
+    # turn the very failure being reported into a templating error.
+    fail_msg: >-
+      {{ inventory_hostname }}: disk encryption did NOT reach the required end
+      state.
+      {{ 'The assessment itself did not complete — treat its output as unknown, not as empty.'
+         if not (clevis_assessment_complete | default(false) | bool)
+         else 'Still needing work: ' ~ (clevis_disks_needing_work | default([]) | join(', ')) }}
+      Provisioning was
+      {{ 'ATTEMPTED' if (clevis_provisioning_needed | default(false) | bool) else 'SKIPPED' }}
+      this run. If it was skipped, the gate in tasks/assess-disks.yml decided
+      there was nothing to do — which contradicts this result, so investigate
+      that first.
+    success_msg: >-
+      {{ inventory_hostname }}: all {{ clevis_raw_disks | default([]) | length }}
+      data disk(s) are LUKS2-formatted and Tang-bound.

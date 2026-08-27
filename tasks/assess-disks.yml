@@ -1,0 +1,60 @@
+---
+# READ-ONLY assessment of what the data disks actually carry, on the HOST.
+#
+# This is the gate for the provisioning block, replacing the old
+# `when: not clevis_recovery_key_stat.stat.exists`. That test asked a
+# CONTROLLER-side question ("does the vaulted key file exist?") and used the
+# answer as a proxy for "is this node provisioned?". It is the wrong proxy in
+# both directions: it cannot tell a finished run from one that died between
+# luksFormat and the crypttab write, and it made a resumed run skip the ENTIRE
+# provisioning block and then fail somewhere unrelated.
+#
+# The truth lives on the disks, so ask them. One round-trip, emitting one token
+# per disk that still needs work, plus a sentinel proving the script ran to
+# completion — an empty stdout must never be mistaken for "nothing to do".
+#
+# Sets:
+#   clevis_disks_needing_work    e.g. ['nvme2n1:needs-format', 'nvme3n1:needs-bind']
+#   clevis_provisioning_needed   true when that list is non-empty
+#   clevis_assessment_complete   true only if the sentinel came back
+#
+# Called TWICE by main.yml: once as the gate, once after provisioning as an
+# unconditional post-condition. Never trust a destructive step's skip — assert
+# the end state instead.
+
+- name: "Assess: which data disks still need LUKS format or Tang bind"
+  ansible.builtin.shell:
+    cmd: |
+      set -uo pipefail
+      export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+      # Interpolated DIRECTLY, not via a shell variable: map('quote') emits
+      # shell-quoted tokens, and re-splitting those through `for d in $var`
+      # keeps the quotes literal ($d becomes 'nvme0n1', so /dev/'nvme0n1').
+      # An empty list is fine here — bash accepts `for d in ; do` and iterates
+      # zero times, which the sentinel below still proves happened.
+      for d in {{ clevis_raw_disks | default([]) | map('quote') | join(' ') }}; do
+        dev="/dev/$d"
+        # A disk named in inventory that is not a block device is an error, not
+        # "nothing to do" — emit it so the post-condition assert fails loudly.
+        if [ ! -b "$dev" ]; then echo "$d:not-a-block-device"; continue; fi
+        if ! cryptsetup isLuks "$dev" 2>/dev/null; then echo "$d:needs-format"; continue; fi
+        # pipefail makes a clevis failure fail the pipeline, so an unreadable
+        # token reads as needs-bind rather than as "already bound". Fails safe.
+        if ! clevis luks list -d "$dev" 2>/dev/null | grep -qE 'sss|tang'; then
+          echo "$d:needs-bind"
+        fi
+      done
+      # Positive proof of completion. Without it, a shell that died on line 1
+      # would return empty stdout and read as a fully-provisioned host.
+      echo 'ASSESSED'
+    executable: /bin/bash
+  register: clevis_disk_assessment
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "Assess: classify the probe output"
+  # Split out so tests/provisioning-gate can drive the REAL classification with
+  # fixture stdout on a runner that has no block devices. A test that exercises
+  # a copy of the logic proves nothing about the logic that ships.
+  ansible.builtin.include_tasks: assess-disks-classify.yml
