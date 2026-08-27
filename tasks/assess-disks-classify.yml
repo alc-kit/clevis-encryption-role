@@ -1,0 +1,22 @@
+---
+# Classify tasks/assess-disks.yml's probe output. See that file for the contract.
+# Driven directly by tests/provisioning-gate with synthetic clevis_disk_assessment.
+
+- name: "Assess: classify the result"
+  ansible.builtin.set_fact:
+    clevis_assessment_complete: >-
+      {{ 'ASSESSED' in (clevis_disk_assessment.stdout_lines | default([])) }}
+    clevis_disks_needing_work: >-
+      {{ clevis_disk_assessment.stdout_lines | default([]) | reject('equalto', 'ASSESSED') | list }}
+
+- name: "Assess: provisioning is needed when any disk still needs work"
+  ansible.builtin.set_fact:
+    clevis_provisioning_needed: "{{ (clevis_disks_needing_work | length) > 0 }}"
+
+- name: "Assess: report"
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: {{ clevis_raw_disks | length }} data disk(s),
+      {{ clevis_disks_needing_work | length }} needing work
+      {{ '(' ~ (clevis_disks_needing_work | join(', ')) ~ ')'
+         if clevis_disks_needing_work | length > 0 else '— all LUKS2 + Tang-bound' }}.
