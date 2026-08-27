@@ -1,0 +1,3 @@
+{"fixture_name":"not-a-block-device","fixture_disks":["nvme0n1","sdz"],
+ "fixture_stdout_lines":["sdz:not-a-block-device","ASSESSED"],
+ "expect_complete":true,"expect_needed":true,"expect_work_count":1,"expect_assert":"fail"}

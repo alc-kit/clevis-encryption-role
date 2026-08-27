@@ -1,0 +1,3 @@
+{"fixture_name":"empty-probe-must-not-pass","fixture_disks":["nvme0n1","nvme1n1"],
+ "fixture_stdout_lines":[],
+ "expect_complete":false,"expect_needed":false,"expect_work_count":0,"expect_assert":"fail"}

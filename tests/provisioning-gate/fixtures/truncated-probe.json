@@ -1,0 +1,3 @@
+{"fixture_name":"truncated-probe","fixture_disks":["nvme0n1"],
+ "fixture_stdout_lines":["nvme0n1:needs-format"],
+ "expect_complete":false,"expect_needed":true,"expect_work_count":1,"expect_assert":"fail"}

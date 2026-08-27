@@ -184,7 +184,7 @@ used `systemd-resolved` (which does its own RFC 6724 sort and never consults
 | Tag | What it runs |
 |---|---|
 | `prestage` | Package install + Tang network preconditions (DNS, IP-family probe + curlrc). Idempotent and safe on un-encrypted nodes. Use this to do most of the setup ahead of the destructive LUKS-format step, shortening the actual maintenance window. |
-| `provision` | The provisioning block only (LUKS format, Clevis bind). Skipped automatically if the recovery key already exists on the controller. |
+| `provision` | The provisioning block only (LUKS format, Clevis bind), plus the disk assessment that gates it and the post-condition that proves the end state. Disks already LUKS2-formatted and Tang-bound are left alone. |
 | `systemd` | The boot ordering block only (crypttab, systemd drop-ins, the `clevis-luks-unlocked.target` seam). Safe to run against already-encrypted live nodes. Does NOT re-run prestage — combine with `--tags prestage,systemd` if you also want the network gate re-validated. |
 
 ### Pre-staging on fresh nodes
@@ -198,12 +198,34 @@ This installs packages and applies network preconditions without touching any di
 
 ## Idempotency
 
-- **Provisioning** is guarded by the presence of the vault-encrypted recovery
-  key on the controller (`host_vars/<hostname>/secrets/luks_recovery_key.txt`).
-  If the file exists, the entire provisioning block is skipped.  Delete the
-  file and re-run only if you intend to wipe and re-encrypt the disks.
+- **Provisioning** is gated on what the **disks** actually carry: the role probes
+  every device in `clevis_raw_disks` and provisions only those that are not yet
+  LUKS2-formatted, or are formatted but not Tang-bound. A fully provisioned node
+  skips the block; a node whose previous run died midway is **resumable** and
+  finishes the disks it never reached.
+- **The recovery key is reused, never regenerated.** If the vaulted key exists on
+  the controller it is decrypted and used; only its absence generates a new one.
+  This matters because a fresh passphrase cannot open a LUKS header a previous
+  run already wrote — `clevis luks bind` would fail with *"No key available with
+  this passphrase"*.
+- **A post-condition assert runs unconditionally**, whether provisioning ran or
+  was skipped, and fails unless every disk is LUKS2-formatted and Tang-bound. It
+  fails *closed*: an incomplete probe is treated as unknown, never as "nothing to
+  do". Device-free regression tests for both the gate and the assert live in
+  `tests/provisioning-gate/`.
 - **Boot ordering** (`--tags systemd`) is fully idempotent and safe to re-run
   on live systems at any time.
+
+> **Changed in 2.1.0.** Provisioning used to be gated on the *presence of the
+> vaulted recovery key file on the controller*, used as a proxy for "this node is
+> already provisioned". That proxy could not distinguish a finished run from one
+> that died between `luksFormat` and the crypttab write, so a resumed run skipped
+> the entire provisioning block, did nothing, and failed later somewhere
+> unrelated. It also meant tearing a node down required *deleting the key file*
+> purely to re-enable provisioning. Consumers that deleted the key to force a
+> re-provision should now rely on the disk state instead; deleting the key only
+> discards your break-glass passphrase, and the role will warn that the node has
+> no recovery path.
 
 ## Recovery key
 
