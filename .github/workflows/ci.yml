@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -60,21 +60,58 @@ jobs:
         run: ansible-lint
 
   ansible-versions:
-    name: syntax-check (ansible-core ${{ matrix.ansible }})
+    name: syntax-check (ansible-core ${{ matrix.ansible }}, py${{ matrix.python }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        ansible: ["2.16.*", "2.17.*", "2.18.*"]
+        # ansible-core x control-node Python. Each series supports a RANGE of
+        # Pythons, so pinning one interpreter tests a single point in a 2-D space and
+        # the interesting breakage lives at the EDGES: the oldest Python (where a
+        # dependency drops support first) and the newest (where an older ansible-core
+        # meets an interpreter released after it).
+        #
+        # So each series is tested at its FLOOR and its CEILING, taken from the
+        # release's own classifiers on PyPI:
+        #     2.16 / 2.17 -> 3.10, 3.11, 3.12
+        #     2.18 / 2.19 -> 3.11, 3.12, 3.13
+        #     2.20 / 2.21 -> 3.12, 3.13, 3.14
+        # The middle version is skipped deliberately: it has never been the one to
+        # break alone, and 12 legs is already the honest cost of this coverage.
+        #
+        # 3.12 is the ONLY interpreter valid for all six series — which is why the
+        # previous single `python-version: "3.12"` pin passed while never exercising
+        # 3.10, 3.13 or 3.14 at all.
+        #
+        # There is no 2.22 on PyPI yet (2.21.3 is newest); add it when it ships.
+        include:
+          - { ansible: "2.16.*", python: "3.10" }
+          - { ansible: "2.16.*", python: "3.12" }
+          - { ansible: "2.17.*", python: "3.10" }
+          - { ansible: "2.17.*", python: "3.12" }
+          - { ansible: "2.18.*", python: "3.11" }
+          - { ansible: "2.18.*", python: "3.13" }
+          - { ansible: "2.19.*", python: "3.11" }
+          - { ansible: "2.19.*", python: "3.13" }
+          - { ansible: "2.20.*", python: "3.12" }
+          - { ansible: "2.20.*", python: "3.14" }
+          - { ansible: "2.21.*", python: "3.12" }
+          - { ansible: "2.21.*", python: "3.14" }
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "${{ matrix.python }}"
 
-      - name: Install ansible-core ${{ matrix.ansible }}
-        run: python -m pip install "ansible-core==${{ matrix.ansible }}"
+      - name: Install ansible-core ${{ matrix.ansible }} on python ${{ matrix.python }}
+        run: |
+          python -VV
+          python -m pip install "ansible-core==${{ matrix.ansible }}"
+          # Prove the pair actually took: pip resolves "2.16.*" to whatever it likes,
+          # and an interpreter mismatch here is the exact thing this matrix exists to
+          # catch, so assert both rather than trusting the install step's exit code.
+          ansible --version
 
       - name: Install role collections
         run: ansible-galaxy collection install -r requirements.yml
@@ -92,7 +129,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -111,7 +148,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
