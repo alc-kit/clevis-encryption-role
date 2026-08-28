@@ -99,7 +99,7 @@ jobs:
           sudo setfacl -m "u:$USER:rw" /var/run/libvirt/libvirt-sock || true
           sudo chmod 0666 /dev/kvm || true
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: steps.gate.outputs.needed == 'true'
         with:
           python-version: "3.12"
