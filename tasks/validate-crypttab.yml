@@ -15,6 +15,17 @@
 # crypt-<dev> target name — NOT from cached host_vars and NOT by re-deriving the
 # device from enumeration order (see the mitigation doc's Non-goals).
 
+- name: "Pre-flight: audit the EXISTING /etc/crypttab before writing to it"
+  # The assertions below check only the lines the role is about to write. A
+  # duplicate or stale line ALREADY in the file is invisible to them and is not
+  # repaired by the writer (lineinfile rewrites only the last line matching a
+  # UUID), so it would survive this run and break a consumer later — e.g. a
+  # storage role that reads its member list from crypttab. Fail here, before
+  # anything is written, naming the line. See audit-crypttab.yml.
+  ansible.builtin.include_tasks: audit-crypttab.yml
+  vars:
+    _clevis_audit_phase: pre-flight
+
 - name: "Pre-flight: read live LUKS UUID + type for each data disk"
   # -o export prints KEY=VALUE lines (UUID=..., TYPE=...); parsed below. rc is
   # non-zero for an unformatted/absent device — tolerated here so the assert
