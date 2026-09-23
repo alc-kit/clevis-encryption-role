@@ -653,6 +653,9 @@ Two GitHub Actions workflows:
 - the role's pre-flight assertions (`tasks/assert-crypttab-unique.yml`) fail the
   play for a duplicate-UUID or unformatted-device set and pass for a unique,
   valid one — exercised with injected `clevis_crypttab_pairs` fixtures
+- the role's audit task (`tasks/audit-crypttab.yml`) fails the play on a
+  duplicate or orphan crypttab and passes a clean or soft-only one — in normal
+  **and** `--check` mode, so the audit cannot silently skip in a dry run
 
 **`default`** (real virtio-disk LUKS):
 
@@ -828,11 +831,15 @@ static crypttab authoring bug (a duplicated/stale UUID), not an enumeration race
 it reproduces deterministically every boot.
 
 **Guardrails in this role.** The role now derives every crypttab UUID from live
-`blkid` at apply time and, before writing crypttab, runs a **pre-flight assert**
-(`tasks/validate-crypttab.yml`) that fails the play on a duplicate or unresolved
-UUID. After writing, it installs and runs a **post-deploy audit**
-(`tasks/verify-crypttab.yml`) that cross-references the whole crypttab against the
-live devices. UUID is the correct stable join key — the role never keys off the
+`blkid` at apply time. Before writing crypttab it **audits the existing file**
+against the live devices and fails the play on a duplicate, stale or crossed
+line already there, then runs a **pre-flight assert** that the lines it is about
+to write have unique, resolvable UUIDs (both in `tasks/validate-crypttab.yml`).
+After writing, it re-runs the **audit** on the result (`tasks/verify-crypttab.yml`).
+The audit runs from the role for each run, including under `--check`, where it
+audits the current file — a dry run therefore reports a bad crypttab instead of
+hiding it. A line the audit rejects is never removed by the role, because the
+writer only manages lines for the disks it provisions; fix it by hand (below). UUID is the correct stable join key — the role never keys off the
 unstable `/dev/nvmeXn1` names and never silently rewrites a UUID from device-node
 guessing.
 

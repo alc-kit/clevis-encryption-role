@@ -1,0 +1,21 @@
+---
+# Device-free harness for tasks/audit-crypttab.yml — the task that runs the audit
+# script from the role against /etc/crypttab. run.sh invokes this once per
+# fixture, with and without --check, passing
+#   -e fixture=<name>   (tests/crypttab-guard/fixtures/crypttab.<name>)
+# The audit runs in offline (--devmap) mode, so no block devices and no root.
+# The --check runs are the regression: the audit must still RUN and still FAIL
+# on a hard finding in check mode.
+
+- name: "Crypttab audit task — fixture harness"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    _fix: "{{ playbook_dir }}/fixtures"
+  tasks:
+    - name: "Run the role's crypttab audit task on the fixture"
+      ansible.builtin.include_tasks: "{{ playbook_dir }}/../../tasks/audit-crypttab.yml"
+      vars:
+        _clevis_audit_phase: pre-flight
+        _clevis_audit_script: "{{ playbook_dir }}/../../files/crypttab-uuid-audit.sh"
+        _clevis_audit_args: "--crypttab {{ _fix }}/crypttab.{{ fixture }} --devmap {{ _fix }}/present.clean"

@@ -1,0 +1,82 @@
+---
+# Run crypttab-uuid-audit.sh against the host's /etc/crypttab and fail the play
+# on a HARD finding (duplicate UUID / stale-orphan UUID / crossed open mapper).
+# Shared by the pre-flight (validate-crypttab.yml, BEFORE any line is written)
+# and the post-deploy verification (verify-crypttab.yml).
+#
+# Inputs:
+#   _clevis_audit_phase   'pre-flight' | 'post-deploy' — labels the report only.
+#   _clevis_audit_args    extra audit arguments (test harness only, e.g.
+#                         '--crypttab <fixture> --devmap <file>'). Default none.
+#   _clevis_audit_script  path to the audit script (test harness only — outside
+#                         the role the files/ lookup does not apply). Default:
+#                         the role's files/crypttab-uuid-audit.sh.
+#
+# Why ansible.builtin.script and not the installed /usr/local/sbin copy: the
+# script is transferred from the role for this run, so the audit does not depend
+# on an install task having run first. That dependency made the audit a silent
+# no-op under --check (the install was only simulated, so the run was skipped,
+# and an empty result read as a clean one) — on a host whose crypttab already
+# carried a duplicate UUID. The audit is read-only, so check_mode: false is safe
+# and the dry run audits the real file.
+#
+# Why the pre-flight matters: configure-disk.yml's lineinfile rewrites only the
+# LAST line matching a UUID and never removes a line whose UUID it does not
+# manage, so a duplicate or stale entry already in the file survives every run.
+# The role deliberately does not prune those lines itself (it cannot tell a stale
+# entry from a disk mid-replacement); it fails and names them for the operator.
+
+- name: "Audit /etc/crypttab ({{ _clevis_audit_phase }})"
+  # Exit codes: 0 clean, 2 hard finding, 3 soft only (a crypto_LUKS device with
+  # no crypttab entry — not fatal, e.g. a disk mid-replacement).
+  ansible.builtin.script:
+    cmd: "{{ _clevis_audit_script | default('crypttab-uuid-audit.sh') }} {{ _clevis_audit_args | default('') }}"
+    executable: /bin/bash
+  register: _crypttab_audit
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: "Show crypttab audit result ({{ _clevis_audit_phase }})"
+  # Never print an empty result for an audit that did not run: an empty list is
+  # exactly what a clean audit looks like.
+  ansible.builtin.debug:
+    msg: >-
+      {{ (['crypttab audit NOT RUN (' ~ _clevis_audit_phase ~ ') — no result was produced;'
+           ' this is NOT a clean result.'])
+         if (_crypttab_audit is skipped or _crypttab_audit.rc is not defined)
+         else (_crypttab_audit.stdout_lines | default([])
+               + ([] if not ansible_check_mode else
+                  ['(check mode: this audited the CURRENT /etc/crypttab, not the file this run would write)'])) }}
+
+- name: "Assert /etc/crypttab has no hard finding ({{ _clevis_audit_phase }})"
+  # Fails CLOSED: an audit that produced no rc (skipped, not run) fails too.
+  # Both messages read the result through .get() — assert templates them BEFORE
+  # evaluating `that`, so a bare .rc would turn "did not run" into a templating
+  # error that names neither the audit nor the fix.
+  #
+  # FAIL lines are picked with regex_findall (a filter), not select('match'):
+  # regex TESTS inside select have returned empty on some ansible-core 2.19+.
+  vars:
+    _audit_ran: "{{ _crypttab_audit.get('rc') is not none }}"
+    _msg_not_run: >-
+      {{ inventory_hostname }}: the {{ _clevis_audit_phase }} crypttab audit did
+      NOT RUN, so /etc/crypttab is unverified. Failing closed.
+    _msg_failed: >-
+      {{ inventory_hostname }}: /etc/crypttab failed the {{ _clevis_audit_phase }}
+      audit (rc={{ _crypttab_audit.get('rc') }}):
+      {{ _crypttab_audit.get('stdout', '') | regex_findall('(?m)^FAIL: .*$') }}.
+      A duplicate or stale-orphan line cannot be repaired by this role — the
+      crypttab writer only rewrites lines for the disks it manages. Remove the
+      offending line(s) by hand (keep a backup), then re-run. Which line is
+      stale: the one whose target name has no open mapper
+      (`dmsetup ls --target crypt`), or whose UUID is on no device (`blkid -U`).
+  ansible.builtin.assert:
+    that:
+      - _crypttab_audit.rc is defined
+      - _crypttab_audit.rc in [0, 3]
+    fail_msg: "{{ _msg_failed if (_audit_ran | bool) else _msg_not_run }}"
+    success_msg: >-
+      /etc/crypttab passed the {{ _clevis_audit_phase }} audit
+      (rc={{ _crypttab_audit.get('rc') }}).
+    quiet: true
