@@ -22,15 +22,9 @@
     group: root
     mode: '0755'
 
-- name: "Audit /etc/crypttab for UUID collisions against live devices"
-  # Exit codes: 0 clean, 2 hard finding (duplicate / stale / crossed mapper),
-  # 3 soft only (a crypto_LUKS device with no crypttab entry — not fatal, e.g. a
-  # disk mid-replacement). Fail the play only on a hard finding.
-  ansible.builtin.command: /usr/local/sbin/crypttab-uuid-audit.sh
-  register: _crypttab_audit
-  changed_when: false
-  failed_when: _crypttab_audit.rc not in [0, 3]
-
-- name: "Show crypttab audit result"
-  ansible.builtin.debug:
-    var: _crypttab_audit.stdout_lines
+- name: "Audit the written /etc/crypttab against live devices"
+  # Runs the audit from the role (not the copy installed above), so it also runs
+  # under --check, where the install is only simulated. See audit-crypttab.yml.
+  ansible.builtin.include_tasks: audit-crypttab.yml
+  vars:
+    _clevis_audit_phase: post-deploy
