@@ -10,6 +10,9 @@
 #      via assert-fixtures.yml with injected clevis_crypttab_pairs — asserts the
 #      play passes for a unique/valid set and fails for a duplicate/unformatted
 #      one.
+#   3. The crypt-<uuid> in-place migration contract (migrate-inplace.yml).
+#   4. The role's audit task (tasks/audit-crypttab.yml) via audit-fixtures.yml,
+#      in real and --check mode — it must run and fail on a hard finding in both.
 #
 # Usage: tests/crypttab-guard/run.sh   (exits non-zero on any unexpected result)
 set -uo pipefail
@@ -75,6 +78,44 @@ elif ansible-playbook -i 'localhost,' -c local "$HERE/migrate-inplace.yml" >/dev
   ok "in-place migration: legacy crypt-<node> -> crypt-<uuid>, idempotent, orphan-free"
 else
   bad "in-place migration (re-run without -q: ansible-playbook -i localhost, -c local $HERE/migrate-inplace.yml)"
+fi
+
+# ── Layer 4: the role's audit TASK (audit-crypttab.yml), incl. check mode ─────
+# The regression: under --check the audit used to be skipped (it ran an installed
+# copy whose install was only simulated) and its empty output read as clean, on a
+# host whose crypttab already carried a duplicate UUID. The audit must RUN and
+# FAIL the play on a hard finding in both modes. Both outcomes are matched on
+# output, not rc alone: a pass must show the script's own verdict line (so a
+# skipped audit cannot pass), and a fail must be the audit assertion (so a play
+# failing for any other reason, e.g. the script not found, does not count).
+echo
+echo "== Layer 4: audit-crypttab.yml against crypttab fixtures (real + --check) =="
+if ! command -v ansible-playbook >/dev/null 2>&1; then
+  echo "SKIP: ansible-playbook not on PATH (Layer 4 skipped)"
+else
+  expect_task() {
+    local fixture="$1" want="$2" mode="$3" out got
+    # shellcheck disable=SC2086  # $mode is empty or a single flag, by design
+    out="$(ansible-playbook -i 'localhost,' -c local $mode \
+      "$HERE/audit-fixtures.yml" -e "fixture=$fixture" 2>&1)"
+    got=$?
+    local label="audit task crypttab.$fixture ${mode:-(real)}"
+    if [ "$want" = "ok" ] && [ "$got" -eq 0 ] \
+       && printf '%s' "$out" | grep -Eq 'crypttab-uuid-audit.sh: (crypttab UUID audit clean|0 hard findings)'; then
+      ok "$label -> passes, and the audit actually ran"
+    elif [ "$want" = "fail" ] && [ "$got" -ne 0 ] \
+       && printf '%s' "$out" | grep -q 'failed the pre-flight audit'; then
+      ok "$label -> fails on the audit assertion"
+    else
+      bad "$label -> rc $got, expected $want (re-run: ansible-playbook -i localhost, -c local $mode $HERE/audit-fixtures.yml -e fixture=$fixture)"
+    fi
+  }
+  for mode in "" "--check"; do
+    expect_task clean  ok   "$mode"
+    expect_task dup    fail "$mode"   # the m-p-proxmox-06/-07 duplicate
+    expect_task orphan fail "$mode"   # a UUID on no device (a reformatted disk)
+    expect_task soft   ok   "$mode"   # soft-only is not fatal
+  done
 fi
 
 echo
