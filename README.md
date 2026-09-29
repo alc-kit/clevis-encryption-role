@@ -84,10 +84,12 @@ automation:
 - Ansible 2.14+
 - `ansible.posix` collection (`ansible-galaxy collection install ansible.posix`)
 - Controller must have `ansible-vault` in `PATH` (bundled with ansible-core)
-- Controller must have `/usr/share/dict/words` for passphrase generation, or
-  set `clevis_vault_password_file` to a pre-existing vault-encrypted key file
+- Controller must have `/usr/share/dict/words` for passphrase generation, unless
+  a vaulted recovery key already exists at `clevis_recovery_key_path` (it is then
+  reused and no passphrase is generated)
 - One or more Tang servers reachable from the target host at provisioning time
-- Target host must have `gather_facts: true` (the role uses `ansible_devices`)
+- Target host must have `gather_facts: true` when `clevis_raw_disks` is not set
+  (disk auto-discovery reads `ansible_facts['devices']`)
 
 ## Role variables
 
@@ -102,6 +104,7 @@ automation:
 | Variable | Default | Description |
 |---|---|---|
 | `clevis_encryption_enabled` | `true` | Set `false` to skip the entire role. Useful when the role is included unconditionally in a playbook but encryption is not needed on every host. |
+| `clevis_raw_disks` | *(discovered)* | Bare device names of the data disks to encrypt (e.g. `[nvme0n1, nvme1n1]`). Unset → auto-discovered: the largest same-size group of non-removable local disks (loop/sr/dm/nbd/md/crypt/zd/zram/rbd excluded). Set it explicitly for anything but homogeneous local disks. |
 | `clevis_vault_password_file` | `"~/.ansible_vault_pass"` | Path to the Ansible Vault password file on the controller, used to encrypt the per-host recovery key. |
 | `clevis_keep_temp_key` | `false` | Retain `/tmp/ansible_luks_key` on the remote host after provisioning. Leave `false` in production. |
 | `clevis_luks_open_options` | `"--allow-discards"` | Options passed to `cryptsetup open` when `clevis-unlock-data` opens each mapper at boot (`clevis luks unlock -o`). The durable place to enable discard, since the `noauto` data disks ignore the crypttab `discard` option. Append `--perf-no_read_workqueue --perf-no_write_workqueue` to make dm-crypt perf flags durable too; set `""` for none. |
@@ -140,7 +143,8 @@ The role assembles a Clevis SSS (Shamir Secret Sharing) configuration with
 `t: 1` — any single Tang server can unlock the disk independently.  This means
 a single Tang server outage does not prevent boot.  To require more than one
 server to be available simultaneously, you can override `tang_sss_cfg` directly
-with a custom JSON string.
+with a custom JSON string — as an extra var (`-e`): `tasks/tang-adv.yml` sets it
+with `set_fact`, which outranks inventory and play vars.
 
 ### Tang IP family (IPv4 / IPv6)
 
@@ -306,7 +310,8 @@ them. Add a consumer role (below) to get a usable pool.
         encrypted_storage_pool_backend: btrfs
         encrypted_storage_pool_name: data
         encrypted_storage_pool_topology: mirror
-        encrypted_storage_pool_devices: [vdb, vdc]
+        # Members are derived from the crypt-<uuid> entries this role writes to
+        # /etc/crypttab — leave encrypted_storage_pool_devices unset.
 ```
 
 ### Compose with a storage consumer — clevis NBDE + ZFS on Proxmox
@@ -513,7 +518,7 @@ stack and run on a KVM-capable runner (or locally):
 |---|---|---|---|
 | 0 | **Repository validation** — `yamllint`, `ansible-lint`, `ansible-core` version syntax-check — **plus** the device-free clevis↔Tang **crypto + IP-family** check | `.yamllint`, `.ansible-lint`, `molecule/network` (`ci.yml`) | any runner (+ Docker for the crypto scenario) |
 | 1 | **LUKS keyslot** — `clevis luks bind`/`unlock -o`, crypttab, durable `allow_discards` | `molecule/default` (`vm-tests.yml`) | **Rootless** libvirt/KVM VM (user in `libvirt` group) |
-| 2 | **Real boot ordering** — boot-time unlock from an external Tang, the seam, and a downstream consumer assembling a pool across it (reboot-durable) | `molecule/vm` (`vm-tests.yml`) | **Rootless** libvirt/KVM (two VMs: encrypted host + external Tang) |
+| 2 | **Real boot ordering** — boot-time unlock from an external Tang, the seam, and a synthetic downstream unit ordered after it (reboot-durable) | `molecule/vm` (`vm-tests.yml`) | **Rootless** libvirt/KVM (two VMs: encrypted host + external Tang) |
 
 The `network` scenario (Tier 0) is a
 [Molecule](https://ansible.readthedocs.io/projects/molecule/) scenario on the
@@ -527,10 +532,12 @@ to a LUKS keyslot needs a real block device. The `network` scenario runs the
 subject of `clevis_curl_ip_version` — is testable anywhere. Boot ordering can only
 be proven by a real boot + reboot, so it lives in the `vm` tier: two VMs on
 Vagrant's NAT network — the encrypted host (`vdb`+`vdc` → LUKS2 → mappers) and a
-separate **external** Tang server it unlocks from at boot. Tier 2 pairs this role
-(NBDE only) with the **`encrypted_storage_pool`** consumer (a **btrfs** raid1 —
-mainline, **no ZFS/DKMS**) to prove the seam works end-to-end across a reboot.
-Tang is its own VM because guest↔guest traffic is pure L2 bridging, whereas
+separate **external** Tang server it unlocks from at boot. Tier 2 runs this role
+NBDE-only and installs a **synthetic downstream oneshot** (`downstream-test.service`,
+`Requires=`/`After=` the seam) instead of a real storage consumer, to prove the
+seam ordering across a reboot without a filesystem/pool in the loop. (The real
+cross-role chain with a pool is tested by `encrypted_storage_pool`'s own VM
+scenarios.) Tang is its own VM because guest↔guest traffic is pure L2 bridging, whereas
 guest→host services are blocked by the host firewall.
 
 A **raw-QEMU fallback** of Tier 2 — no libvirt, no Vagrant, no root (user-mode
@@ -571,10 +578,6 @@ ansible-galaxy collection install ansible.posix community.general
 sudo usermod -aG libvirt "$USER"
 ```
 
-The Tier-2 (`vm`) scenario also pulls the `encrypted_storage_pool` consumer role
-into its scenario `roles/` directory (via `molecule/vm/requirements.yml`) so it
-can prove the seam against a real downstream consumer.
-
 Two environment variables are required for the VM tiers (see the note below on why):
 
 ```bash
@@ -596,7 +599,7 @@ export LIBVIRT_DEFAULT_URI=qemu:///system
 ### Running the tests
 
 ```bash
-cd ansible/roles/clevis-encryption
+cd clevis-encryption-role    # the repository root
 
 # Tier-0 — repository validation (no runtime) + device-free crypto (Docker)
 yamllint .
@@ -610,10 +613,13 @@ export LIBVIRT_DEFAULT_URI=qemu:///system
 # Tier-1 — real virtio-disk LUKS keyslot layer (fast, no reboot)
 molecule test              # the 'default' scenario — no sudo
 
-# Tier-2 — real boot ordering: 2 VMs, clevis NBDE + btrfs consumer, provision +
-#          REBOOT + verify (no ZFS, no DKMS)
+# Tier-2 — real boot ordering: 2 VMs, clevis NBDE + a synthetic downstream unit,
+#          provision + REBOOT + verify (no pool, no ZFS, no DKMS)
 molecule test -s vm
 ```
+
+`test/run.sh` wraps the two VM tiers and sets both environment variables for you
+(`./test/run.sh` runs `vm`; `MOLECULE_SCENARIO=default ./test/run.sh` runs Tier 1).
 
 `molecule test` runs the full lifecycle (`create → prepare → converge →
 idempotence → verify → destroy`); the `vm` scenario swaps `idempotence` for a
@@ -626,12 +632,16 @@ Two GitHub Actions workflows:
 
 - **`ci.yml`** (every push / PR): the Tier-0 gate — `yamllint`, `ansible-lint`,
   an `ansible-core` version matrix syntax-check, the device-free `network`
-  scenario (Docker), and the `crypttab-guard` regression test (the crypttab
-  UUID-collision audit script + the pre-flight assertions, device-free). Cheap,
-  no VMs.
-- **`vm-tests.yml`** (PRs touching role/test code, or manual dispatch): Tiers 1–2
-  (`default`, `vm`) on libvirt/KVM. It bootstraps libvirt + Vagrant +
-  `vagrant-libvirt` on the runner and needs nested KVM (`/dev/kvm`).
+  scenario (Docker), and the device-free regression tests — `shellcheck` of the
+  audit script and harnesses, `tests/crypttab-guard` (the crypttab UUID-collision
+  audit script + the pre-flight assertions), `tests/discovery` (the disk
+  auto-discovery selection) and `tests/provisioning-gate` (the disk-state
+  provisioning gate and its post-condition). Cheap, no VMs.
+- **`vm-tests.yml`** (every PR, or manual dispatch): Tiers 1–2 (`default`, `vm`)
+  on libvirt/KVM. Every matrix leg always reports; `tests/ci/vm-tests-needed.sh`
+  skips the expensive steps only when every changed file is inert (`docs/`,
+  `*.md`, `.gitignore`). It bootstraps libvirt + Vagrant + `vagrant-libvirt` on the
+  runner and needs nested KVM (`/dev/kvm`).
 
 ### What is tested
 
@@ -657,6 +667,16 @@ Two GitHub Actions workflows:
   duplicate or orphan crypttab and passes a clean or soft-only one — in normal
   **and** `--check` mode, so the audit cannot silently skip in a dry run
 
+**`discovery`** (device-free): the real `tasks/discover-disks.yml` against
+injected `clevis_discovery_devices` maps — homogeneous disks, a mixed-size host
+(numeric, not lexicographic, size sort) and the rejected device prefixes.
+
+**`provisioning-gate`** (device-free): the real gate classification
+(`tasks/assess-disks-classify.yml`) and post-condition
+(`tasks/assert-provisioned.yml`) against fixture probe output — a fresh host, a
+partially-run host, a non-block device, and an empty or truncated probe, which
+must never read as "all provisioned".
+
 **`default`** (real virtio-disk LUKS):
 
 - `/etc/crypttab` has the expected `crypt-<uuid>` entry with `_netdev`,
@@ -670,28 +690,32 @@ Two GitHub Actions workflows:
 - a vendored harness proves `clevis luks unlock -o "--allow-discards"` and the
   live-refresh path land `allow_discards`
 
-**`vm`** (real boot ordering, post-reboot — clevis NBDE + btrfs consumer):
+**`vm`** (real boot ordering — clevis NBDE + a synthetic downstream unit):
 
-- both data-disk `crypt-<uuid>` mappers are open after boot with `allow_discards`
-  still set (durable across the reboot, not just the live-apply)
-- `clevis-luks-unlocked.target` is active and systemd logged "Reached target"
-  this boot — the public NBDE seam
-- the seam ordering held across roles at boot:
+- pre-reboot (`converge.yml`, checks 1–5): each disk is LUKS2 with
+  `aes-xts-plain64` / 512-bit key; a forced `luksClose` + `clevis luks unlock`
+  succeeds; each mapper sits on the right backing device and a byte-exact
+  round-trip (with cross-wire detection) passes; a nonce at the last sector reads
+  back exactly
+- post-reboot (`verify.yml`): `clevis-luks-unlocked.target` is active and systemd
+  logged "Reached target" this boot — the public NBDE seam
+- `clevis-unlock-data` is active and logged a successful unlock — the disks were
+  opened at boot from the **external** Tang (the `clevis-tang` VM) over the network
+- the seam ordering held at boot (check 6): `downstream-test.service` ran, and
   `clevis-unlock-data.service` ≤ `clevis-luks-unlocked.target` ≤
-  `encrypted-storage-assemble.service` (the consumer ran after the seam)
-- `clevis-unlock-data` logged a successful unlock — the disks were opened at boot
-  from the **external** Tang (the `clevis-tang` VM) over the network
-- the downstream `encrypted_storage_pool` (btrfs) assembled + mounted the pool at
-  `/srv/data`, real I/O round-trips, and `encrypted-storage-ready.target` is
-  active (the consumer's barrier)
+  `downstream-test.service`
+- both data-disk `crypt-<uuid>` mappers still carry `allow_discards` (durable
+  across the reboot, not just the live-apply)
+- the data-plane checks 3+4 pass again after the real boot cycle (check 7)
 
-In the `network` and `default` scenarios the provisioning block (LUKS format on
-real disks, Clevis bind) is **skipped** because `prepare.yml` pre-creates the
-recovery-key file — the same mechanism that prevents re-provisioning on live
-nodes.  The `vm` scenario is the opposite: `prepare.yml` *removes* the
-recovery-key gate so the role provisions for real — it formats the disks and
-binds Clevis, then the btrfs consumer assembles the pool, and after a reboot the
-test verifies both the boot-time unlock and the pool come up across the seam.
+Provisioning is gated on what the disks carry (see [Idempotency](#idempotency)).
+In the `network` scenario it is **skipped** because `clevis_raw_disks: []`; in
+`default` it is skipped because `prepare.yml` already LUKS-formats and
+Clevis-binds `/dev/vdb` itself (its pre-created recovery-key file only means the
+key is reused rather than generated). The `vm` scenario starts from blank disks,
+so the role provisions for real — it formats the disks and binds Clevis
+(`prepare.yml` removes any stale recovery key so a fresh one is generated), and
+after a reboot the test verifies the boot-time unlock and the seam ordering.
 
 ### How disk selection works
 
@@ -700,7 +724,7 @@ defined`.  The `default` scenario pre-sets `clevis_raw_disks: [vdb]` and the `vm
 scenario `[vdb, vdc]` — the extra virtio disks the libvirt provider attaches to
 the VM; the `network` scenario sets `clevis_raw_disks: []` so the per-disk loops
 are empty and nothing touches a block device.  Either way the role never inspects
-`ansible_devices`, which is unreliable in test substrates.
+`ansible_facts['devices']`, which is unreliable in test substrates.
 
 ## Troubleshooting
 
@@ -719,9 +743,15 @@ Trying to load …/libcryptsetup-token-clevis.so: cannot open shared object file
 No usable token is available.
 ```
 
-**Fix:** This role uses `dmsetup suspend/reload/resume` to rewrite the dm-crypt
-kernel device table directly, which does not require any token handler or Tang
-connectivity.  The existing kernel keyring reference is reused as-is.
+**Fix:** This role does not use `--token-only`. It pipes the passphrase into
+`cryptsetup refresh --allow-discards --key-file -`, recovering it with
+`clevis luks pass -s <slot>` and falling back to decrypting the LUKS2 Clevis
+token (`cryptsetup token export` → `clevis decrypt`), so no token handler is
+needed. Both paths decrypt through Tang, so Tang must be reachable. (A raw
+`dmsetup reload` is not used: it fails with "Required key not available",
+because the volume key sits in the opening process's keyring.) If recovery
+fails the task fails loudly, and discard takes effect at the next boot via
+`clevis-unlock-data`.
 
 If you see this error outside of Ansible, confirm the installed cryptsetup
 version with `cryptsetup --version` and check whether
