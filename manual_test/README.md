@@ -3,7 +3,7 @@
 This is a **self-contained, dependency-light** version of the Tier-2 boot-ordering
 test. It proves the same thing as the `molecule/vm` scenario — that the role's
 data disks are unlocked **at boot** from an **external** Tang over the network,
-the decoupled import chain runs, and `allow_discards` survives a reboot — but it
+`clevis-luks-unlocked.target` is reached, and `allow_discards` survives a reboot — but it
 does so with **raw QEMU + a container**, needing **no libvirt, no Vagrant, and no
 root**.
 
@@ -56,6 +56,7 @@ container port and QEMU's slirp gateway. Falls back to TCG if `/dev/kvm` is abse
 
 ```bash
 manual_test/run.sh test        # full: Tang + build + boot + apply + reboot + verify
+manual_test/run.sh build       # download base image, make disks, build seed ISO
 manual_test/run.sh up          # just start Tang + boot the VM (then ssh in)
 manual_test/run.sh teardown    # stop VM + Tang, remove overlays (keep base cache)
 manual_test/run.sh clean       # also remove the cached base image
@@ -77,15 +78,16 @@ live under `manual_test/.run/` and are gitignored.
 
 - `clevis-luks-unlocked.target` is **active** (the public NBDE seam was reached);
 - `clevis-unlock-data` succeeded;
-- both `crypt-vdb` / `crypt-vdc` mappers are open with **`allow_discards`**
-  (durable across the reboot, not just the live-apply);
+- the `crypt-<uuid>` mappers of both `vdb` and `vdc` are open with
+  **`allow_discards`** (durable across the reboot, not just the live-apply);
 - `clevis-unlock-data` logged a successful unlock (network unlock from the
   external Tang).
 
 This is an **NBDE-only smoke test** — it proves the unlock + the seam. Assembling
 a storage pool on the unlocked mappers is a downstream consumer's job (see
-`encrypted_storage_pool` / `proxmox_encrypted_storage`); the full cross-role boot
-chain (including a real pool) is covered by `molecule/vm`.
+`encrypted_storage_pool` / `proxmox_encrypted_storage`). `molecule/vm` adds the
+seam-ordering check against a synthetic downstream unit; the cross-role chain with
+a real pool is covered by `encrypted_storage_pool`'s own VM scenarios.
 
 ## Files
 
