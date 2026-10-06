@@ -217,13 +217,25 @@ This installs packages and applies network preconditions without touching any di
   LUKS2-formatted, or are formatted but not Tang-bound. A fully provisioned node
   skips the block; a node whose previous run died midway is **resumable** and
   finishes the disks it never reached.
+- **A disk bound to Tang servers this host does not declare is refused, never
+  reused.** "Is it Tang-bound?" is not enough: a reinstalled node can keep the
+  previous build's LUKS containers, bound to *another* fleet's Tang with a
+  passphrase this controller does not hold. The assessment reads every bound
+  disk's Tang URLs and fails, naming disk and URLs, when any of them is not in
+  `tang_servers` (trailing slashes ignored; a binding with no readable URL counts
+  as foreign). Bound to a *subset* of `tang_servers` is fine. The role never
+  rebinds or reformats such a disk: add the servers to `tang_servers` if they are
+  this host's, otherwise re-encrypt deliberately (with proxmox-install:
+  `install-proxmox.yml -e encryption_force_reprovision=true`, which destroys the
+  disks' contents). The refusal lives in `tasks/assess-disks.yml`, so it also
+  stops consumers that include only that file.
 - **The recovery key is reused, never regenerated.** If the vaulted key exists on
   the controller it is decrypted and used; only its absence generates a new one.
   This matters because a fresh passphrase cannot open a LUKS header a previous
   run already wrote — `clevis luks bind` would fail with *"No key available with
   this passphrase"*.
 - **A post-condition assert runs unconditionally**, whether provisioning ran or
-  was skipped, and fails unless every disk is LUKS2-formatted and Tang-bound. It
+  was skipped, and fails unless every disk is LUKS2-formatted and bound to declared Tang servers. It
   fails *closed*: an incomplete probe is treated as unknown, never as "nothing to
   do". Device-free regression tests for both the gate and the assert live in
   `tests/provisioning-gate/`.
@@ -713,9 +725,12 @@ injected `clevis_discovery_devices` maps — homogeneous disks, a mixed-size hos
 
 **`provisioning-gate`** (device-free): the real gate classification
 (`tasks/assess-disks-classify.yml`) and post-condition
-(`tasks/assert-provisioned.yml`) against fixture probe output — a fresh host, a
+(`tasks/assert-provisioned.yml`) and the foreign-binding refusal
+(`tasks/assert-no-foreign-binding.yml`) against fixture probe output — a fresh host, a
 partially-run host, a non-block device, and an empty or truncated probe, which
-must never read as "all provisioned".
+must never read as "all provisioned"; disks bound to another fleet's Tang, to one
+declared and one undeclared URL, with no readable URL, or with `tang_servers`
+undefined, which must be refused; and disks bound to a declared subset, which must not.
 
 **`default`** (real virtio-disk LUKS):
 

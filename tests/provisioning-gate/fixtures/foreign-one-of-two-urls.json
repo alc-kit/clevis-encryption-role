@@ -1,0 +1,7 @@
+{"fixture_name":"foreign-one-of-two-urls",
+ "_comment":"One declared URL plus one undeclared (two slots, or an sss list mixing fleets). ANY undeclared URL is foreign.",
+ "fixture_disks":["nvme0n1","nvme1n1"],
+ "fixture_stdout_lines":["nvme0n1:bound:https://tang-a.example,https://tang-b.example",
+                         "nvme1n1:bound:https://tang-a.example,https://tang.invalid","ASSESSED"],
+ "expect_complete":true,"expect_needed":false,"expect_work_count":0,"expect_foreign_count":1,
+ "expect_refusal":"fail","expect_assert":"fail"}

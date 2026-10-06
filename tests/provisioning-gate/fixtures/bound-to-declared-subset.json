@@ -1,0 +1,6 @@
+{"fixture_name":"bound-to-declared-subset",
+ "_comment":"Bound to ONE of the two declared servers (e.g. a server added to tang_servers later): allowed. Trailing slashes compare equal.",
+ "fixture_disks":["nvme0n1","nvme1n1"],
+ "fixture_stdout_lines":["nvme0n1:bound:https://tang-a.example/","nvme1n1:bound:https://tang-b.example","ASSESSED"],
+ "expect_complete":true,"expect_needed":false,"expect_work_count":0,"expect_foreign_count":0,
+ "expect_refusal":"pass","expect_assert":"pass"}

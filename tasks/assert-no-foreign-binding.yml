@@ -1,0 +1,30 @@
+---
+# Refuse data disks bound to Tang servers this host does not declare (rebuild
+# defect D1, 2026-09-16). Included at the end of assess-disks.yml, so it runs
+# wherever the assessment runs. Lives in its own file so tests/provisioning-gate
+# drives the REAL assertion.
+#
+# REFUSE, never repair. Such a container comes from a previous build or another
+# fleet: its passphrase is normally not the one this controller holds, and
+# rebinding or reformatting it unattended would either fail half way or destroy
+# data someone may still need. The operator decides.
+
+- name: "Assess: no data disk is bound to an undeclared Tang server"
+  ansible.builtin.assert:
+    that:
+      - (clevis_disks_foreign_binding | default(['UNASSESSED'])) | length == 0
+    # Both messages are templated before the task runs: read through defaults.
+    fail_msg: >-
+      {{ inventory_hostname }}: {{ clevis_disks_foreign_binding | default([]) | length }}
+      data disk(s) are LUKS-formatted and Clevis-bound to Tang servers this host
+      does not declare — {{ clevis_disks_foreign_binding | default(['UNASSESSED']) | join('; ') }}.
+      Declared tang_servers: {{ tang_servers | default([]) | map(attribute='url') | list
+                                 if tang_servers is defined else '(none — tang_servers is not set)' }}.
+      This role will NOT reuse, rebind or reformat them: they are from a previous
+      build or another fleet, and the controller's recovery key will normally not
+      open them. If those servers ARE this host's, add them to tang_servers.
+      Otherwise re-encrypt the disks deliberately (this DESTROYS their contents) —
+      with proxmox-install: install-proxmox.yml -e encryption_force_reprovision=true.
+    success_msg: >-
+      {{ inventory_hostname }}: every bound data disk names only declared Tang servers.
+    quiet: true

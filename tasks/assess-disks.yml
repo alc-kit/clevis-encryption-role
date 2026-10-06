@@ -13,10 +13,22 @@
 # per disk that still needs work, plus a sentinel proving the script ran to
 # completion — an empty stdout must never be mistaken for "nothing to do".
 #
+# A disk that is already bound reports WHICH Tang servers it is bound to, and
+# the classification compares them with this host's tang_servers. "Is it bound?"
+# alone is the wrong question: a reinstalled node that kept the previous build's
+# containers answers yes — bound to ANOTHER fleet's Tang, with a passphrase this
+# controller does not hold — and reusing them is how a prod node ended up asking
+# test Tang servers to unlock its disks (rebuild defect D1, 2026-09-16).
+#
 # Sets:
 #   clevis_disks_needing_work    e.g. ['nvme2n1:needs-format', 'nvme3n1:needs-bind']
 #   clevis_provisioning_needed   true when that list is non-empty
+#   clevis_disks_foreign_binding e.g. ['nvme4n1 -> https://tang.other.example']
 #   clevis_assessment_complete   true only if the sentinel came back
+#
+# A foreign binding is REFUSED here, inside the assessment, so every caller —
+# this role's gate and post-condition, and consumers that run only this file —
+# stops before acting on it. Nothing in this role rebinds or reformats it.
 #
 # Called TWICE by main.yml: once as the gate, once after provisioning as an
 # unconditional post-condition. Never trust a destructive step's skip — assert
@@ -38,11 +50,19 @@
         # "nothing to do" — emit it so the post-condition assert fails loudly.
         if [ ! -b "$dev" ]; then echo "$d:not-a-block-device"; continue; fi
         if ! cryptsetup isLuks "$dev" 2>/dev/null; then echo "$d:needs-format"; continue; fi
-        # pipefail makes a clevis failure fail the pipeline, so an unreadable
-        # token reads as needs-bind rather than as "already bound". Fails safe.
-        if ! clevis luks list -d "$dev" 2>/dev/null | grep -qE 'sss|tang'; then
+        # A clevis failure leaves $bound empty, so an unreadable token reads as
+        # needs-bind rather than as "already bound". Fails safe.
+        bound="$(clevis luks list -d "$dev" 2>/dev/null)" || bound=""
+        if ! grep -qE 'sss|tang' <<<"$bound"; then
           echo "$d:needs-bind"
+          continue
         fi
+        # Bound: report the Tang URLs it names, comma-separated, possibly none.
+        # The comparison with tang_servers is made by the classification, not
+        # here, so the device-free tests drive the logic that ships.
+        urls="$(grep -oE '"url" *: *"[^"]*"' <<<"$bound" \
+                | sed -E 's/^"url" *: *"(.*)"$/\1/' | sort -u | paste -sd, -)"
+        echo "$d:bound:$urls"
       done
       # Positive proof of completion. Without it, a shell that died on line 1
       # would return empty stdout and read as a fully-provisioned host.
@@ -58,3 +78,7 @@
   # fixture stdout on a runner that has no block devices. A test that exercises
   # a copy of the logic proves nothing about the logic that ships.
   ansible.builtin.include_tasks: assess-disks-classify.yml
+
+- name: "Assess: refuse disks bound to Tang servers this host does not declare"
+  # Its own file for the same reason: tests/provisioning-gate drives it.
+  ansible.builtin.include_tasks: assert-no-foreign-binding.yml

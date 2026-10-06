@@ -13,6 +13,16 @@
   vars:
     clevis_raw_disks: "{{ fixture_disks | default([]) }}"
   tasks:
+    # The declared Tang servers the bound disks are compared with. Two, as in the
+    # fleets; a fixture can override them, or set fixture_tang_undefined to leave
+    # tang_servers undefined altogether (a play var cannot be "omitted").
+    - name: "Declare the host's Tang servers"
+      ansible.builtin.set_fact:
+        tang_servers: >-
+          {{ fixture_tang_servers | default([{'url': 'https://tang-a.example'},
+                                             {'url': 'https://tang-b.example'}]) }}
+      when: not (fixture_tang_undefined | default(false) | bool)
+
     - name: "Inject the synthetic probe result"
       ansible.builtin.set_fact:
         clevis_disk_assessment:
@@ -27,11 +37,35 @@
           - (clevis_assessment_complete | bool) == (expect_complete | bool)
           - (clevis_provisioning_needed | bool) == (expect_needed | bool)
           - (clevis_disks_needing_work | length) == (expect_work_count | int)
+          - (clevis_disks_foreign_binding | length) == (expect_foreign_count | default(0) | int)
         fail_msg: >-
           {{ fixture_name }}: classification mismatch —
           complete={{ clevis_assessment_complete | default('?') }} (want {{ expect_complete }}),
           needed={{ clevis_provisioning_needed | default('?') }} (want {{ expect_needed }}),
-          work={{ clevis_disks_needing_work | default([]) | length }} (want {{ expect_work_count }}).
+          work={{ clevis_disks_needing_work | default([]) | length }} (want {{ expect_work_count }}),
+          foreign={{ clevis_disks_foreign_binding | default([]) }} (want {{ expect_foreign_count | default(0) }}).
+        quiet: true
+
+    # The foreign-binding refusal (D1) runs inside assess-disks.yml, before
+    # anything acts on the assessment. Same negative-control shape as below.
+    - name: "Run the REAL foreign-binding refusal and record whether it fired"
+      block:
+        - name: "Refusal"
+          ansible.builtin.include_tasks: ../../tasks/assert-no-foreign-binding.yml
+        - name: "It passed"
+          ansible.builtin.set_fact:
+            gate_refusal_outcome: pass
+      rescue:
+        - name: "It fired"
+          ansible.builtin.set_fact:
+            gate_refusal_outcome: fail
+
+    - name: "Refusal outcome must match the fixture"
+      ansible.builtin.assert:
+        that: gate_refusal_outcome == (expect_refusal | default('pass'))
+        fail_msg: >-
+          {{ fixture_name }}: the foreign-binding refusal {{ gate_refusal_outcome }}ed,
+          but the fixture expects it to {{ expect_refusal | default('pass') }}.
         quiet: true
 
     # The post-condition is SUPPOSED to fail for most of these fixtures, so run

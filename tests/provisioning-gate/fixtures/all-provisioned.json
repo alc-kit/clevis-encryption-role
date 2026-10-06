@@ -1,3 +1,4 @@
 {"fixture_name":"all-provisioned","fixture_disks":["nvme0n1","nvme1n1"],
- "fixture_stdout_lines":["ASSESSED"],
+ "fixture_stdout_lines":["nvme0n1:bound:https://tang-a.example,https://tang-b.example",
+                         "nvme1n1:bound:https://tang-a.example,https://tang-b.example","ASSESSED"],
  "expect_complete":true,"expect_needed":false,"expect_work_count":0,"expect_assert":"pass"}

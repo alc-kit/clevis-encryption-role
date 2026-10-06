@@ -1,13 +1,55 @@
 ---
 # Classify tasks/assess-disks.yml's probe output. See that file for the contract.
 # Driven directly by tests/provisioning-gate with synthetic clevis_disk_assessment.
+#
+# Probe lines:  <disk>:needs-format | <disk>:needs-bind | <disk>:not-a-block-device
+#               <disk>:bound:<url>[,<url>...]   (the url list may be empty)
+#               ASSESSED                         (sentinel)
+#
+# A bound disk is FOREIGN when any URL it names is not one of tang_servers' urls,
+# or when it names no URL at all (an sss/tang binding we cannot read is not one
+# we may trust). Bound to a SUBSET of tang_servers is fine. URLs compare exactly
+# after dropping trailing slashes — a scheme or port difference is a different
+# server as far as this check knows.
+#
+# An explicit for-loop with `in`, not select()/selectattr() with a regex test:
+# those return empty on ansible-core 2.19+ (Data-Tagging regression).
 
 - name: "Assess: classify the result"
   ansible.builtin.set_fact:
     clevis_assessment_complete: >-
       {{ 'ASSESSED' in (clevis_disk_assessment.stdout_lines | default([])) }}
     clevis_disks_needing_work: >-
-      {{ clevis_disk_assessment.stdout_lines | default([]) | reject('equalto', 'ASSESSED') | list }}
+      {%- set out = [] -%}
+      {%- for line in clevis_disk_assessment.stdout_lines | default([]) -%}
+        {%- if line != 'ASSESSED' and ':bound:' not in line -%}
+          {%- set _ = out.append(line) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+    clevis_disks_foreign_binding: >-
+      {%- set declared = [] -%}
+      {%- for t in tang_servers | default([]) -%}
+        {%- set _ = declared.append((t.url | default('') | string).rstrip('/')) -%}
+      {%- endfor -%}
+      {%- set out = [] -%}
+      {%- for line in clevis_disk_assessment.stdout_lines | default([]) -%}
+        {%- if ':bound:' in line -%}
+          {%- set disk, urls = line.split(':bound:', 1) -%}
+          {%- set bad = [] -%}
+          {%- for u in urls.split(',') if u | length > 0 -%}
+            {%- if u.rstrip('/') not in declared -%}
+              {%- set _ = bad.append(u) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- if urls | length == 0 -%}
+            {%- set _ = out.append(disk ~ ' -> (binding names no Tang URL)') -%}
+          {%- elif bad | length > 0 -%}
+            {%- set _ = out.append(disk ~ ' -> ' ~ (bad | join(', '))) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
 
 - name: "Assess: provisioning is needed when any disk still needs work"
   ansible.builtin.set_fact:
@@ -16,7 +58,13 @@
 - name: "Assess: report"
   ansible.builtin.debug:
     msg: >-
-      {{ inventory_hostname }}: {{ clevis_raw_disks | length }} data disk(s),
-      {{ clevis_disks_needing_work | length }} needing work
-      {{ '(' ~ (clevis_disks_needing_work | join(', ')) ~ ')'
-         if clevis_disks_needing_work | length > 0 else '— all LUKS2 + Tang-bound' }}.
+      {{ inventory_hostname }}: {{ clevis_raw_disks | length }} data disk(s);
+      {{ clevis_disks_needing_work | length }} needing work{{ _work }};
+      {{ clevis_disks_foreign_binding | length }} bound to UNDECLARED Tang servers{{ _foreign }}.
+  vars:
+    _work: >-
+      {{ (' (' ~ (clevis_disks_needing_work | join(', ')) ~ ')')
+         if clevis_disks_needing_work | length > 0 else '' }}
+    _foreign: >-
+      {{ (' (' ~ (clevis_disks_foreign_binding | join('; ')) ~ ')')
+         if clevis_disks_foreign_binding | length > 0 else '' }}
