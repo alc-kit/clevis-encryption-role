@@ -59,5 +59,12 @@
   ansible.builtin.debug:
     msg: >-
       {{ inventory_hostname }}: {{ clevis_raw_disks | length }} data disk(s);
-      {{ clevis_disks_needing_work | length }} needing work{{ (' (' ~ (clevis_disks_needing_work | join(', ')) ~ ')') if clevis_disks_needing_work | length > 0 else '' }};
-      {{ clevis_disks_foreign_binding | length }} bound to UNDECLARED Tang servers{{ (' (' ~ (clevis_disks_foreign_binding | join('; ')) ~ ')') if clevis_disks_foreign_binding | length > 0 else '' }}.
+      {{ clevis_disks_needing_work | length }} needing work{{ _work }};
+      {{ clevis_disks_foreign_binding | length }} bound to UNDECLARED Tang servers{{ _foreign }}.
+  vars:
+    _work: >-
+      {{ (' (' ~ (clevis_disks_needing_work | join(', ')) ~ ')')
+         if clevis_disks_needing_work | length > 0 else '' }}
+    _foreign: >-
+      {{ (' (' ~ (clevis_disks_foreign_binding | join('; ')) ~ ')')
+         if clevis_disks_foreign_binding | length > 0 else '' }}
