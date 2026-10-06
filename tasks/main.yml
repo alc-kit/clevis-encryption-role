@@ -41,7 +41,12 @@
     # touched by any old version.  Ordered FIRST so the IPv6 live-reset happens
     # before the network-prereq IP-family probe (which may need IPv6 up).
     - name: "Clean up artifacts from previous role versions"
-      ansible.builtin.include_tasks: cleanup-legacy.yml
+      ansible.builtin.include_tasks:
+        file: cleanup-legacy.yml
+        # apply: carries the tag INTO the included tasks. On the include task
+        # alone it selects the include and runs none of them (measured).
+        apply:
+          tags: [always]
       tags: always
 
     # ── PRESTAGE ────────────────────────────────────────────────────────────
@@ -53,7 +58,12 @@
     # is unchanged.
 
     - name: "Prestage: packages + Tang network preconditions"
-      ansible.builtin.include_tasks: prestage.yml
+      ansible.builtin.include_tasks:
+        file: prestage.yml
+        # apply: carries the tag INTO the included tasks. On the include task
+        # alone it selects the include and runs none of them (measured).
+        apply:
+          tags: [prestage]
       tags: [prestage]
 
     # ── PRE-FLIGHT ──────────────────────────────────────────────────────────
@@ -82,14 +92,24 @@
     #   tags: always — the disk list is consumed by both the provisioning and
     #     systemd blocks; without it the --tags systemd path has no disk list.
     - name: "Discover raw physical data disks (largest size group)"
-      ansible.builtin.include_tasks: discover-disks.yml
+      ansible.builtin.include_tasks:
+        file: discover-disks.yml
+        # apply: carries the tag INTO the included tasks. On the include task
+        # alone it selects the include and runs none of them (measured).
+        apply:
+          tags: [always]
       when: clevis_raw_disks is not defined
       tags: always
 
     # What do the disks ACTUALLY carry? This replaces the controller-side file
     # test as the provisioning gate — see tasks/assess-disks.yml for why.
     - name: "Assess what the data disks already carry"
-      ansible.builtin.include_tasks: assess-disks.yml
+      ansible.builtin.include_tasks:
+        file: assess-disks.yml
+        # apply: carries the tag INTO the included tasks. On the include task
+        # alone it selects the include and runs none of them (measured).
+        apply:
+          tags: [provision]
       tags: [provision]
 
     # Provisioned disks with no vaulted key means the DR key is GONE. The role
@@ -207,11 +227,21 @@
     # Fails CLOSED: if the assessment did not run, or its facts are missing, the
     # defaults below are the failing values, not the passing ones.
     - name: "Re-read the disks after provisioning"
-      ansible.builtin.include_tasks: assess-disks.yml
+      ansible.builtin.include_tasks:
+        file: assess-disks.yml
+        # apply: carries the tag INTO the included tasks. On the include task
+        # alone it selects the include and runs none of them (measured).
+        apply:
+          tags: [provision]
       tags: [provision]
 
     - name: "POST-CONDITION: prove the end state on disk"
-      ansible.builtin.include_tasks: assert-provisioned.yml
+      ansible.builtin.include_tasks:
+        file: assert-provisioned.yml
+        # apply: carries the tag INTO the included tasks. On the include task
+        # alone it selects the include and runs none of them (measured).
+        apply:
+          tags: [provision]
       tags: [provision]
 
     # Also unconditional: a group can be mixed without this run formatting anything

@@ -195,6 +195,12 @@ used `systemd-resolved` (which does its own RFC 6724 sort and never consults
 | `provision` | The provisioning block only (LUKS format, Clevis bind), plus the disk assessment that gates it and the post-condition that proves the end state. Disks already LUKS2-formatted and Tang-bound are left alone. |
 | `systemd` | The boot ordering block only (crypttab, systemd drop-ins, the `clevis-luks-unlocked.target` seam). Safe to run against already-encrypted live nodes. Does NOT re-run prestage — combine with `--tags prestage,systemd` if you also want the network gate re-validated. |
 
+Before 2.2.1 these tags selected their includes but ran none of the included
+tasks — a tag on an `include_tasks` does not reach the file it includes without
+`apply:`. `--tags prestage` installed nothing, and `--tags provision` skipped disk
+discovery, the assessment and the post-condition. CI now guards it
+(`tests/guards/include-apply.py`).
+
 ### Pre-staging on fresh nodes
 
 ```bash
