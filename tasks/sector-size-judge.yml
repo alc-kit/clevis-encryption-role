@@ -1,0 +1,26 @@
+---
+# The verdict behind assert-sector-size.yml, separate from the probe so fixtures can
+# drive it (tests/sector-size). Reads the facts sector-size-decide.yml set.
+
+- name: "Sector size | the group must be uniform where the consumer requires it"
+  ansible.builtin.assert:
+    that: clevis_sector_sizes_uniform | bool
+    fail_msg: >-
+      {{ inventory_hostname }}: the LUKS data disks have MIXED encryption sector sizes
+      ({{ clevis_sector_probe.stdout_lines | select('match', '^SECTOR ') | list }}).
+      An LVM volume group refuses mixed logical block sizes. Re-encrypt the odd
+      member(s) at {{ clevis_group_sector_sizes | max }} bytes before building the pool.
+    success_msg: >-
+      {{ inventory_hostname }}: every LUKS data disk uses
+      {{ clevis_group_sector_sizes | first | default('(none yet)') }}-byte sectors.
+  when: clevis_require_uniform_sector_size | bool
+
+- name: "Sector size | WARN on a mixed group (tolerated by this consumer)"
+  ansible.builtin.debug:
+    msg: >-
+      *** {{ inventory_hostname }}: the LUKS data disks have MIXED encryption sector
+      sizes {{ clevis_group_sector_sizes }}. Harmless under ZFS, but an LVM pool will
+      refuse these members — re-encrypt the odd one(s) before any conversion. ***
+  when:
+    - not (clevis_require_uniform_sector_size | bool)
+    - not (clevis_sector_sizes_uniform | bool)

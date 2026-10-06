@@ -40,7 +40,9 @@
 
 - name: "Format with LUKS2: {{ disk_device }}"
   ansible.builtin.command: >
-    cryptsetup luksFormat --batch-mode
+    cryptsetup luksFormat --batch-mode --type luks2
+    --cipher {{ clevis_luks_cipher }} --key-size {{ clevis_luks_key_size }}
+    --sector-size {{ clevis_luks_sector_size_effective }}
     --key-file /tmp/ansible_luks_key
     "/dev/{{ disk_device }}"
   changed_when: true

@@ -1,0 +1,12 @@
+---
+# POST-CONDITION: re-read the group after provisioning and judge it. Runs whether or
+# not anything was formatted — a skip is not evidence. Mixed sizes fail when the
+# consumer needs uniformity (clevis_require_uniform_sector_size: an LVM pool), and
+# warn otherwise (ZFS tolerates them; failing would break converge on a node that is
+# already mixed and harms nothing).
+
+- name: "Sector size | re-read the group"
+  ansible.builtin.include_tasks: sector-size.yml
+
+- name: "Sector size | judge it"
+  ansible.builtin.include_tasks: sector-size-judge.yml

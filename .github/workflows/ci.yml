@@ -159,7 +159,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: shellcheck the audit script and test harnesses
-        run: shellcheck files/crypttab-uuid-audit.sh tests/crypttab-guard/run.sh tests/discovery/run.sh tests/provisioning-gate/run.sh
+        run: shellcheck files/crypttab-uuid-audit.sh tests/crypttab-guard/run.sh tests/discovery/run.sh tests/provisioning-gate/run.sh tests/sector-size/run.sh
 
       - name: Run the crypttab UUID-collision regression tests
         run: tests/crypttab-guard/run.sh
@@ -173,3 +173,9 @@ jobs:
       # empty probe result must never read as "every disk is provisioned".
       - name: Run the provisioning-gate regression tests
         run: tests/provisioning-gate/run.sh
+
+      # One LUKS sector size per data group: a bare luksFormat picked it per disk
+      # and mixed 4096 and 512 mappers, which an LVM volume group refuses. These
+      # fixtures pin the group rule and prove a mixed group FAILS where it must.
+      - name: Run the LUKS sector-size tests
+        run: tests/sector-size/run.sh

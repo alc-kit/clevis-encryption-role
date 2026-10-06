@@ -1,0 +1,1 @@
+{"fixture_name":"unreadable-member-refused","fixture_probe":["SECTOR /dev/nvme0n1 4096","SECTOR /dev/nvme1n1 unknown","PROBED"],"expect_decide":"fail"}

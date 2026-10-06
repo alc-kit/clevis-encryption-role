@@ -1,0 +1,1 @@
+{"fixture_name":"fresh-group-512-configured","fixture_configured":512,"fixture_probe":["PROBED"],"expect_decide":"ok","expect_effective":512,"expect_uniform":true,"expect_judge":"pass"}

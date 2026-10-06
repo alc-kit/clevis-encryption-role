@@ -1,0 +1,1 @@
+{"fixture_name":"bad-configured-size-refused","fixture_configured":1024,"fixture_probe":["PROBED"],"expect_decide":"fail"}

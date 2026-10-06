@@ -117,6 +117,10 @@ automation:
 | `clevis_curl_probe_connect_timeout` | `5` | Per-server connect timeout (seconds) for `auto` reachability probing. |
 | `clevis_curl_probe_max_time` | `15` | Per-server total timeout (seconds) for `auto` reachability probing. |
 | `clevis_ipv4_only` | `false` | **Deprecated** — superseded by `clevis_curl_ip_version`. When `true` (and `clevis_curl_ip_version` is left at `auto`) it maps to `clevis_curl_ip_version: ipv4`, with a deprecation warning. |
+| `clevis_luks_sector_size` | `4096` | LUKS2 encryption sector size (`512` or `4096`) for a **fresh** data-disk group. A group that already has LUKS members always gets *their* size, so a replacement disk joins at its siblings' size. Never chosen per disk — see [Upgrade notes → 2.2](#22--one-luks-format-per-data-group). |
+| `clevis_require_uniform_sector_size` | `false` | Fail the run (instead of warning) when the data disks' LUKS sector sizes differ. Set `true` where an LVM pool is built on the mappers — LVM refuses mixed logical block sizes; ZFS tolerates them. |
+| `clevis_luks_cipher` | `aes-xts-plain64` | Cipher passed to `luksFormat`. Pinned so a disk formatted by a later cryptsetup matches its siblings. |
+| `clevis_luks_key_size` | `512` | Volume key size in bits passed to `luksFormat` (512-bit XTS = AES-256). |
 | `clevis_recovery_key_path` | `{{ inventory_dir }}/host_vars/{{ inventory_hostname }}/secrets/luks_recovery_key.txt` | Path on the Ansible controller where the vault-encrypted recovery key is stored. Override when using a non-standard inventory layout or a separate secrets directory. |
 
 > **Storage variables live on the consumer role.** Pool name, topology,
@@ -427,6 +431,29 @@ not reached, so services gated on it stay stopped until you intervene.
 
 ## Upgrade notes
 
+### 2.2 — one LUKS format per data group
+
+Before 2.2 `luksFormat` ran with cryptsetup's defaults, and cryptsetup picks the
+encryption sector size **per disk** from that disk's *physical* sector size. A
+group of drives that report 4096 physical, plus one replacement that reports 512,
+came out with five 4096-byte mappers and one 512-byte mapper. ZFS never noticed;
+`vgcreate` refused the set — after the old pool had already been torn down.
+
+2.2 decides the format for the **group**:
+
+- the sector size matches the group's existing LUKS members, else
+  `clevis_luks_sector_size` (4096) for a fresh group;
+- cipher and key size are pinned (`clevis_luks_cipher`, `clevis_luks_key_size`)
+  to the values Debian's cryptsetup already defaulted to;
+- after provisioning, and after a `replace-disk`, the group is re-read from the
+  LUKS headers: mixed sizes **fail** when `clevis_require_uniform_sector_size` is
+  true (an LVM consumer), and warn otherwise.
+
+Already-encrypted disks are never re-formatted, so upgrading changes nothing on
+disk. A node that is already mixed shows the warning on its next run; it matters
+only before an LVM pool is built on it — re-encrypt the odd member at the group's
+size first.
+
 ### 2.0 — ZFS removed
 
 As of 2.0 this role is **NBDE-only**. Everything to do with creating, importing,
@@ -653,6 +680,13 @@ Two GitHub Actions workflows:
   `--ipv6` **fails** — proving the pin is actually read and is decisive
 - the device-independent boot-ordering artifacts are deployed
   (the `clevis-luks-askpass` network-online gate and `clevis-unlock-data.service`)
+
+**`sector-size`** (device-free): the group rule and its verdict, from fixtures —
+a fresh group gets the configured size, a replacement joins a 512 group at 512, a
+mixed group fails only where uniformity is required, and an incomplete or
+unreadable probe is refused rather than read as "no members". On real
+cryptsetup, the `default` scenario asserts the provisioned header carries the
+pinned sector size, cipher and key size.
 
 **`crypttab-guard`** (device-free):
 

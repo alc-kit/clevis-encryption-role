@@ -1,0 +1,1 @@
+{"fixture_name":"replacement-joins-512-group","fixture_configured":4096,"fixture_probe":["SECTOR /dev/nvme0n1 512","SECTOR /dev/nvme1n1 512","SECTOR /dev/nvme2n1 512","PROBED"],"expect_decide":"ok","expect_effective":512,"expect_uniform":true,"expect_judge":"pass"}

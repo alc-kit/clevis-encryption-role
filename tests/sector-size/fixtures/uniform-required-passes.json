@@ -1,0 +1,1 @@
+{"fixture_name":"uniform-required-passes","fixture_require_uniform":true,"fixture_probe":["SECTOR /dev/nvme0n1 4096","SECTOR /dev/nvme7n1 4096","PROBED"],"expect_decide":"ok","expect_effective":4096,"expect_uniform":true,"expect_judge":"pass"}
