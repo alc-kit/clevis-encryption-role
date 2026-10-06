@@ -58,22 +58,32 @@
     - name: "Resolve mappers"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/tasks/resolve-mappers.yml"
 
-    # ── Check 1 — LUKS structural (LUKS2 + cipher + key size) ──────────────────
-    - name: "Check 1 — LUKS2 format + expected cipher/key size (cryptsetup defaults)"
-      # The role calls `cryptsetup luksFormat` with no explicit cipher/key size, so
-      # the effective defaults are cryptsetup's: aes-xts-plain64 / 512-bit key.
+    # ── Check 1 — LUKS structural (LUKS2 + the role's pinned format) ────────────
+    - name: "Check 1 — LUKS2, the pinned cipher/key size, and one 4096-byte sector size"
+      # Since 2.2 the role pins the format instead of inheriting cryptsetup's
+      # defaults: --type luks2 --cipher aes-xts-plain64 --key-size 512, and one
+      # sector size for the whole group (4096 for these blank disks). The VOLUME key
+      # size is the keyslot's `Key:` line; `Cipher key:` is the keyslot AREA's key,
+      # which merely follows it by default. The mapper's
+      # logical block size is asserted too: that, not the header, is what an LVM
+      # volume group compares across its members.
       ansible.builtin.shell:
         executable: /bin/bash
         cmd: |
           set -euo pipefail
           d="/dev/{{ item.dev }}"
-          ver="$(cryptsetup luksDump "$d" | awk '/^Version:/{print $2; exit}')"
-          cipher="$(cryptsetup luksDump "$d" | awk '/[Cc]ipher:/{print $2; exit}')"
-          keybits="$(cryptsetup luksDump "$d" | awk '/Cipher key:/{print $3; exit}')"
-          echo "version=$ver cipher=$cipher keybits=$keybits"
+          dump="$(cryptsetup luksDump "$d")"
+          ver="$(awk '/^Version:/{print $2; exit}' <<<"$dump")"
+          cipher="$(awk '$1 == "cipher:" {print $2; exit}' <<<"$dump")"
+          sector="$(awk '$1 == "sector:" {print $2; exit}' <<<"$dump")"
+          keybits="$(awk '$1 == "Key:" {print $2; exit}' <<<"$dump")"
+          mapss="$(blockdev --getss "/dev/mapper/{{ item.mapper }}")"
+          echo "version=$ver cipher=$cipher sector=$sector keybits=$keybits mapper_ss=$mapss"
           [ "$ver" = "2" ]
           [ "$cipher" = "aes-xts-plain64" ]
+          [ "$sector" = "4096" ]
           [ "$keybits" = "512" ]
+          [ "$mapss" = "4096" ]
       loop: "{{ _dp_map }}"
       register: _c1
       changed_when: false

@@ -23,26 +23,6 @@
       register: _vdb_uuid
       changed_when: false
 
-    # ── 0. the LUKS format parameters are the pinned ones, not cryptsetup's ──
-    # A bare luksFormat chose the sector size per disk from its physical sector
-    # size and mixed 4096 and 512 in one group. Prove on REAL cryptsetup that the
-    # role's pins reached the header (fixtures can only prove the decision).
-    - name: "Read the data disk's LUKS header"
-      ansible.builtin.command: cryptsetup luksDump /dev/vdb
-      register: _vdb_dump
-      changed_when: false
-
-    - name: "Assert sector size, cipher and key size are the role's pins"
-      ansible.builtin.assert:
-        that:
-          - _vdb_dump.stdout is search('(?m)^\\s+sector:\\s+4096 \\[bytes\\]')
-          - _vdb_dump.stdout is search('(?m)^\\s+cipher:\\s+aes-xts-plain64$')
-          - _vdb_dump.stdout is search('(?m)^\\s+Key:\\s+512 bits')
-        fail_msg: |-
-          /dev/vdb was not formatted with the pinned parameters
-          (sector 4096, aes-xts-plain64, 512-bit key):
-          {{ _vdb_dump.stdout }}
-
     # ── 1. crypttab ──────────────────────────────────────────────────────────
     - name: "Read /etc/crypttab"
       ansible.builtin.slurp:
