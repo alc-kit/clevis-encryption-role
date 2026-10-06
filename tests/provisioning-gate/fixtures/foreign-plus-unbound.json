@@ -1,0 +1,6 @@
+{"fixture_name":"foreign-plus-unbound",
+ "_comment":"A foreign disk next to one that still needs a bind: both reported, refusal still fires.",
+ "fixture_disks":["nvme0n1","nvme1n1"],
+ "fixture_stdout_lines":["nvme0n1:bound:https://tang.invalid","nvme1n1:needs-bind","ASSESSED"],
+ "expect_complete":true,"expect_needed":true,"expect_work_count":1,"expect_foreign_count":1,
+ "expect_refusal":"fail","expect_assert":"fail"}

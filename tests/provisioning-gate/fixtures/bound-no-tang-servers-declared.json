@@ -1,0 +1,6 @@
+{"fixture_name":"bound-no-tang-servers-declared",
+ "_comment":"tang_servers undefined: nothing is declared, so every bound URL is foreign. Fails closed.",
+ "fixture_disks":["nvme0n1"],"fixture_tang_undefined":true,
+ "fixture_stdout_lines":["nvme0n1:bound:https://tang-a.example","ASSESSED"],
+ "expect_complete":true,"expect_needed":false,"expect_work_count":0,"expect_foreign_count":1,
+ "expect_refusal":"fail","expect_assert":"fail"}

@@ -1,0 +1,6 @@
+{"fixture_name":"bound-no-url",
+ "_comment":"sss/tang matched but no URL could be read: an unreadable binding is not a trusted one.",
+ "fixture_disks":["nvme0n1"],
+ "fixture_stdout_lines":["nvme0n1:bound:","ASSESSED"],
+ "expect_complete":true,"expect_needed":false,"expect_work_count":0,"expect_foreign_count":1,
+ "expect_refusal":"fail","expect_assert":"fail"}

@@ -1,0 +1,7 @@
+{"fixture_name":"foreign-binding-d1",
+ "_comment":"The 2026-09-16 shape: every disk LUKS + sss-bound, but to ANOTHER fleet's Tang servers. Must be refused, never reused.",
+ "fixture_disks":["nvme0n1","nvme1n1"],
+ "fixture_stdout_lines":["nvme0n1:bound:https://tang-test.other.example,https://tang-t0.other.example",
+                         "nvme1n1:bound:https://tang-test.other.example,https://tang-t0.other.example","ASSESSED"],
+ "expect_complete":true,"expect_needed":false,"expect_work_count":0,"expect_foreign_count":2,
+ "expect_refusal":"fail","expect_assert":"fail"}
