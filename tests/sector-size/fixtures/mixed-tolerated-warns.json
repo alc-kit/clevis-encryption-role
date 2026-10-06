@@ -1,0 +1,1 @@
+{"fixture_name":"mixed-tolerated-warns","fixture_require_uniform":false,"fixture_probe":["SECTOR /dev/nvme0n1 4096","SECTOR /dev/nvme7n1 512","PROBED"],"expect_decide":"ok","expect_effective":4096,"expect_uniform":false,"expect_judge":"pass"}

@@ -1,0 +1,43 @@
+---
+# The pure decision behind sector-size.yml. Reads clevis_sector_probe.stdout_lines
+# ("SECTOR <device> <bytes>" per existing LUKS member, then "PROBED"); writes the
+# three facts listed there. Fails CLOSED: a probe that did not finish, or a member
+# whose size could not be read, is refused rather than read as "no members".
+
+- name: "Sector size | the configured size is one cryptsetup and LVM both accept"
+  ansible.builtin.assert:
+    that: (clevis_luks_sector_size | int) in [512, 4096]
+    fail_msg: >-
+      clevis_luks_sector_size must be 512 or 4096 (got '{{ clevis_luks_sector_size }}').
+    quiet: true
+
+- name: "Sector size | the probe must have completed"
+  ansible.builtin.assert:
+    that:
+      - clevis_sector_probe is defined
+      - "'PROBED' in (clevis_sector_probe.stdout_lines | default([]))"
+    fail_msg: >-
+      {{ inventory_hostname }}: the LUKS sector-size probe did not complete, so the
+      group's size is unknown. Refusing to format rather than guess.
+    quiet: true
+
+- name: "Sector size | every member's size must be readable"
+  vars:
+    _members: "{{ clevis_sector_probe.stdout_lines | select('match', '^SECTOR ') | list }}"
+  ansible.builtin.assert:
+    that: _members | select('match', '^SECTOR \\S+ [0-9]+$') | list | length == _members | length
+    fail_msg: >-
+      {{ inventory_hostname }}: could not read the LUKS sector size of every existing
+      member: {{ _members | reject('match', '^SECTOR \\S+ [0-9]+$') | list }}.
+    quiet: true
+
+- name: "Sector size | resolve"
+  vars:
+    _sizes: >-
+      {{ clevis_sector_probe.stdout_lines | select('match', '^SECTOR ')
+         | map('split') | map(attribute=2) | map('int') | unique | sort | list }}
+  ansible.builtin.set_fact:
+    clevis_group_sector_sizes: "{{ _sizes }}"
+    clevis_sector_sizes_uniform: "{{ (_sizes | length) <= 1 }}"
+    clevis_luks_sector_size_effective: >-
+      {{ (_sizes | first) if (_sizes | length) == 1 else (clevis_luks_sector_size | int) }}

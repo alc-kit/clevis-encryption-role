@@ -1,0 +1,51 @@
+---
+# Decide the LUKS encryption sector size for the data-disk GROUP before anything is
+# formatted, and describe the group as it stands. See defaults/main.yml
+# (clevis_luks_sector_size) for why a per-disk choice is wrong.
+#
+# The group is read from BOTH places a member can be known from: the crypt-* lines
+# of /etc/crypttab (what a replacement joins — clevis_raw_disks need not be set on
+# that path) and clevis_raw_disks (what first provisioning formats). Only devices
+# that exist and carry a LUKS header count; a bare disk has no size yet.
+#
+# Probe and decision are separate files so the decision runs against fixtures
+# (tests/sector-size) on a machine with no disks.
+#
+# Sets (via sector-size-decide.yml):
+#   clevis_group_sector_sizes          sorted unique sizes of the existing members
+#   clevis_sector_sizes_uniform        true when there is at most one size
+#   clevis_luks_sector_size_effective  the size provision-disk.yml formats with
+
+- name: "Sector size | read the LUKS sector size of every existing group member"
+  ansible.builtin.shell: |
+    set -o pipefail
+    devs=""
+    while read -r name src _; do
+      case "$name" in crypt-*) ;; *) continue ;; esac
+      case "$src" in UUID=*) devs="$devs /dev/disk/by-uuid/${src#UUID=}" ;; *) devs="$devs $src" ;; esac
+    done < <(grep -v '^[[:space:]]*#' /etc/crypttab 2>/dev/null || true)
+    for d in {{ (clevis_raw_disks | default([])) | map('quote') | join(' ') }}; do
+      devs="$devs /dev/$d"
+    done
+    for d in $devs; do
+      [ -b "$d" ] || continue
+      r=$(readlink -f "$d")
+      cryptsetup isLuks "$r" 2>/dev/null || continue
+      dump=$(cryptsetup luksDump "$r")
+      if printf '%s\n' "$dump" | grep -q '^Version:[[:space:]]*1'; then
+        s=512
+      else
+        s=$(printf '%s\n' "$dump" | awk '$1 == "sector:" { print $2; exit }')
+      fi
+      echo "SECTOR $r ${s:-unknown}"
+    done | sort -u
+    echo PROBED
+  args:
+    executable: /bin/bash
+  register: clevis_sector_probe
+  changed_when: false
+  # A READ: it must run under --check too, or a dry run decides from nothing.
+  check_mode: false
+
+- name: "Sector size | decide"
+  ansible.builtin.include_tasks: sector-size-decide.yml

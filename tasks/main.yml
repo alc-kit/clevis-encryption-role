@@ -169,6 +169,15 @@
           when: not clevis_recovery_key_stat.stat.exists
           no_log: true
 
+        # One size for the whole group, decided BEFORE the first format: match the
+        # existing members, else clevis_luks_sector_size. Per-disk choice is what
+        # mixed 4096 and 512 in one group (see defaults/main.yml).
+        - name: "Decide the LUKS sector size for the data-disk group"
+          ansible.builtin.include_tasks:
+            file: sector-size.yml
+            apply:
+              tags: [provision]
+
         - name: "Provision encryption on each data disk"
           ansible.builtin.include_tasks: provision-disk.yml
           loop: "{{ clevis_raw_disks }}"
@@ -203,6 +212,16 @@
 
     - name: "POST-CONDITION: prove the end state on disk"
       ansible.builtin.include_tasks: assert-provisioned.yml
+      tags: [provision]
+
+    # Also unconditional: a group can be mixed without this run formatting anything
+    # (a replacement made by an older version). Fails only where the consumer needs
+    # uniformity (clevis_require_uniform_sector_size), warns otherwise.
+    - name: "POST-CONDITION: the data disks share one LUKS sector size"
+      ansible.builtin.include_tasks:
+        file: assert-sector-size.yml
+        apply:
+          tags: [provision]
       tags: [provision]
 
     # ── BLOCK: BOOT ORDERING ────────────────────────────────────────────────

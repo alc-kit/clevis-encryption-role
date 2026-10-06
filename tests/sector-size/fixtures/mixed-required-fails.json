@@ -1,0 +1,1 @@
+{"fixture_name":"mixed-required-fails","fixture_require_uniform":true,"fixture_probe":["SECTOR /dev/nvme0n1 4096","SECTOR /dev/nvme1n1 4096","SECTOR /dev/nvme2n1 4096","SECTOR /dev/nvme3n1 4096","SECTOR /dev/nvme6n1 4096","SECTOR /dev/nvme7n1 512","PROBED"],"expect_decide":"ok","expect_effective":4096,"expect_uniform":false,"expect_judge":"fail"}

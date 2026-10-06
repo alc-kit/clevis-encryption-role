@@ -1,0 +1,66 @@
+---
+# Device-free harness for the LUKS sector-size decision and verdict
+# (tasks/sector-size-decide.yml + tasks/sector-size-judge.yml). The fixture supplies
+# what the probe in tasks/sector-size.yml would have printed on a real node; the
+# REAL decision and verdict files run against it. run.sh owns pass/fail.
+- name: "LUKS sector-size fixture"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    clevis_luks_sector_size: "{{ fixture_configured | default(4096) }}"
+    clevis_require_uniform_sector_size: "{{ fixture_require_uniform | default(false) }}"
+  tasks:
+    - name: "Inject the synthetic probe result"
+      ansible.builtin.set_fact:
+        clevis_sector_probe:
+          stdout_lines: "{{ fixture_probe }}"
+
+    - name: "Run the REAL decision and record whether it refused"
+      block:
+        - name: "Decide"
+          ansible.builtin.include_tasks: ../../tasks/sector-size-decide.yml
+        - name: "It decided"
+          ansible.builtin.set_fact:
+            got_decide: ok
+      rescue:
+        - name: "It refused"
+          ansible.builtin.set_fact:
+            got_decide: fail
+
+    - name: "Decision outcome must match the fixture"
+      ansible.builtin.assert:
+        that: got_decide == expect_decide
+        fail_msg: "{{ fixture_name }}: decision {{ got_decide }}, fixture expects {{ expect_decide }}"
+        quiet: true
+
+    - name: "The decided facts must match the fixture"
+      ansible.builtin.assert:
+        that:
+          - (clevis_luks_sector_size_effective | int) == (expect_effective | int)
+          - (clevis_sector_sizes_uniform | bool) == (expect_uniform | bool)
+        fail_msg: >-
+          {{ fixture_name }}: effective={{ clevis_luks_sector_size_effective }} (want
+          {{ expect_effective }}), uniform={{ clevis_sector_sizes_uniform }} (want {{ expect_uniform }})
+        quiet: true
+      when: expect_decide == 'ok'
+
+    - name: "Run the REAL verdict and record whether it failed"
+      when: expect_decide == 'ok'
+      block:
+        - name: "Judge"
+          ansible.builtin.include_tasks: ../../tasks/sector-size-judge.yml
+        - name: "It passed"
+          ansible.builtin.set_fact:
+            got_judge: pass
+      rescue:
+        - name: "It failed"
+          ansible.builtin.set_fact:
+            got_judge: fail
+
+    - name: "Verdict must match the fixture"
+      ansible.builtin.assert:
+        that: got_judge == expect_judge
+        fail_msg: "{{ fixture_name }}: verdict {{ got_judge }}, fixture expects {{ expect_judge }}"
+        success_msg: "{{ fixture_name }}: as expected"
+      when: expect_decide == 'ok'

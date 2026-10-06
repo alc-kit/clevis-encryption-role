@@ -21,6 +21,36 @@ clevis_vault_password_file: "~/.ansible_vault_pass"
 # provisioning completes.  Leave false in production.
 clevis_keep_temp_key: false
 
+# ── LUKS encryption sector size ──────────────────────────────────────────────
+# A bare `cryptsetup luksFormat` picks the encryption sector size per disk from
+# that disk's PHYSICAL sector size. One group can therefore come out mixed — on a
+# 2026-10-06 conversion five members reported 4096 physical and one (a replacement
+# drive, 512 physical) did not, so five mappers had 4096-byte logical blocks and one
+# had 512, and `vgcreate` refused the set after the old pool was already gone.
+#
+# So the size is decided for the GROUP, never per disk (tasks/sector-size.yml):
+#   * a group that already has LUKS members -> new disks MATCH them (a replacement
+#     disk joins at the size its siblings already have);
+#   * a fresh group (nothing LUKS yet)      -> clevis_luks_sector_size.
+# 4096 is valid on a 512-logical device and is the right size for NVMe. 512 is the
+# only choice for a device whose LOGICAL sector is 512 that must match old members.
+clevis_luks_sector_size: 4096
+
+# Cipher and key size, pinned so that nothing about a member depends on which
+# cryptsetup version formatted it: a replacement disk formatted years from now must
+# match its siblings, not that day's compiled-in default. These are the values
+# Debian's cryptsetup has defaulted to (aes-xts-plain64, 512-bit XTS = AES-256), so
+# pinning them changes nothing for a disk formatted today. Unlike the sector size
+# they do not have to match for a pool to work — this is reproducibility, not repair.
+clevis_luks_cipher: aes-xts-plain64
+clevis_luks_key_size: 512
+
+# Fail (instead of warn) when the group's LUKS sector sizes differ. LVM refuses
+# physical volumes with mixed logical block sizes, so a consumer building an LVM
+# pool on the crypt-* mappers sets this true; ZFS tolerates the mix (ashift), so it
+# defaults to a warning rather than breaking converge on a node that is already mixed.
+clevis_require_uniform_sector_size: false
+
 # ── Boot-time unlock (fail-degraded) ──────────────────────────────────────────
 # clevis-unlock-data.service retries Clevis/Tang decryption per disk at boot,
 # distinguishing a missing block device from a decrypt failure, and always
