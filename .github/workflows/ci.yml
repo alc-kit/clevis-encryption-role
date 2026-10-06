@@ -179,3 +179,9 @@ jobs:
       # fixtures pin the group rule and prove a mixed group FAILS where it must.
       - name: Run the LUKS sector-size tests
         run: tests/sector-size/run.sh
+
+      # A tag on an include task selects the include and runs NONE of the included
+      # tasks under --tags (measured); `apply:` is what carries it inside. The
+      # README's --tags prestage/provision did nothing until this was fixed.
+      - name: "A self-tagged dynamic include carries apply:"
+        run: python3 tests/guards/include-apply.py
