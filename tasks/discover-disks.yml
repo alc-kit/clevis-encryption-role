@@ -3,8 +3,9 @@
 #
 # Included from main.yml solely when the caller did NOT supply clevis_raw_disks
 # (see the include guard there). An explicit, inventory-declared device list is
-# always preferred, and is REQUIRED for multipath / FC / iSCSI / SAN — see
-# docs/luks-uuid-naming-migration.md §2.3/§8.
+# always preferred, and is REQUIRED for multipath / FC / iSCSI / SAN: there the
+# same LUN appears as several path devices, asynchronously and in any order,
+# and only the caller knows which multipath aggregate to encrypt.
 #
 # SCOPE NOTE: choosing WHICH physical devices to encrypt is a storage-topology /
 # inventory decision and is arguably outside this NBDE role's remit (the role's
