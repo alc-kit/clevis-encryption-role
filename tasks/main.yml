@@ -83,8 +83,7 @@
 
     # Auto-discovery is a LOCAL-DISK CONVENIENCE only, and is isolated in
     # discover-disks.yml so it is easy to deprecate/relocate (choosing which
-    # devices to encrypt is a storage-topology/inventory concern — see that file
-    # and docs/luks-uuid-naming-migration.md).
+    # devices to encrypt is a storage-topology/inventory concern — see that file).
     #   when: not defined — an explicit, inventory-declared clevis_raw_disks is
     #     always preferred (and required for multipath/SAN); discovery only fills
     #     the gap when the caller supplied nothing. Molecule/test harnesses that
